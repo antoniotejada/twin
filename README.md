@@ -10,9 +10,15 @@ PyQt5 twin panel file manager playground, but functional
 
 *[Art &copy; Greg Rutkowski](https://www.artstation.com/artwork/k4lYqK)*
 
-## Directory comparison in table mode
+### Directory comparison in table mode
 
 ![image](https://github.com/user-attachments/assets/d5e76a81-da54-470e-98cc-bf23b73a638d)
+
+### Voidtools Evertyhing search pane in thumbnail mode
+
+![image](https://github.com/user-attachments/assets/b8b09379-6159-4855-8709-423c8c69faf2)
+
+*[Art &copy; Greg Rutkowski](https://www.artstation.com/artwork/k4lYqK)*
 
 ## Features
 
@@ -35,10 +41,16 @@ PyQt5 twin panel file manager playground, but functional
 - Directory size calculation in background
 - View file in external editor
 - Current directory keyboard file search
+- C include file parsing for automatic DLL hooking from Python
+- Load Total Commander WCX packer plugins  (total7zip, iso...)
+- Load Total Commander WFX filesystem plugins (sftp dav...)
+- [Voidtools Everything](https://www.voidtools.com/) integration, realtime search string typing and and display results in file panel
+- Directory history navigation by popup menu
+- Zip Python native compressed archive listing, view with external editor
+- [Localsend](https://github.com/localsend/localsend) integration, discover devices, send selected files to selected devices
 
 ## TODO
 
-- Voidtools Everything integration
 - Sorting by column
 - Use multiprocessing instead of multithreading to avoid GIL UI blocking
 - Keyboard file filtering
@@ -48,9 +60,9 @@ PyQt5 twin panel file manager playground, but functional
 - Backround task management
 - Tabs
 - Bookmarks
-- Directory history navigation by combobox
+- Full compressed archive / WCX packer support (create, read, update, delete)
+- Config file (current state, recent directories, plugins, recent searches...)
 - Drag & Drop
-- Compressed archive listing
 - Menus, About
 
 ## Requirements
@@ -59,3 +71,22 @@ PyQt5 twin panel file manager playground, but functional
 - PyQt5
 - PIL
 - Total Commander for external viewer
+
+## Optional Tools
+
+### Voidtools Everything
+
+- Install Everything from https://www.voidtools.com/downloads/
+- Copy Voidtools Everything SDK from https://www.voidtools.com/Everything-SDK.zip into the _out directory
+
+### Total Commander Plugins
+
+WCX and WFX Total Commander plugins can be copied to the _out directory
+- Unpack Total7Zip from https://www.ghisler.ch/board/viewtopic.php?t=28125 into _out\total7zip
+- Unpack sftp from https://www.ghisler.ch/board/viewtopic.php?f=6&t=19994 into _out\sftpplug
+
+### Localsend
+
+Install the app https://github.com/localsend/localsend
+
+Send files to other machines or devices in the local network with automatic device discovery

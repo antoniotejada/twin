@@ -20,6 +20,12 @@ PyQt5 twin panel file manager playground, but functional
 
 *[Art &copy; Greg Rutkowski](https://www.artstation.com/artwork/k4lYqK)*
 
+### Voidtools Everything search pane in thumbnail mode with tabs
+
+![twin_tabs](https://github.com/user-attachments/assets/85a509cd-849f-4ba4-9d98-ff59c392e171)
+
+*[Art &copy; Greg Rutkowski](https://www.artstation.com/artwork/k4lYqK)*
+
 ## Features
 
 - Twin panel
@@ -48,6 +54,9 @@ PyQt5 twin panel file manager playground, but functional
 - Directory history navigation by popup menu
 - Zip Python native compressed archive listing, view with external editor
 - [Localsend](https://github.com/localsend/localsend) integration, discover devices, send selected files to selected devices
+- Tabs
+- Bookmarks
+- Config file
 
 ## TODO
 
@@ -58,10 +67,7 @@ PyQt5 twin panel file manager playground, but functional
 - Report copy/move progress
 - Background copy, move 
 - Backround task management
-- Tabs
-- Bookmarks
 - Full compressed archive / WCX packer support (create, read, update, delete)
-- Config file (current state, recent directories, plugins, recent searches...)
 - Drag & Drop
 - Menus, About
 
@@ -70,7 +76,6 @@ PyQt5 twin panel file manager playground, but functional
 - Python 2.7
 - PyQt5
 - PIL
-- Total Commander for external viewer
 
 ## Optional Tools
 
@@ -85,8 +90,14 @@ WCX and WFX Total Commander plugins can be copied to the _out directory
 - Unpack Total7Zip from https://www.ghisler.ch/board/viewtopic.php?t=28125 into _out\total7zip
 - Unpack sftp from https://www.ghisler.ch/board/viewtopic.php?f=6&t=19994 into _out\sftpplug
 
+External viewer (configurable)
+
 ### Localsend
 
 Install the app https://github.com/localsend/localsend
 
 Send files to other machines or devices in the local network with automatic device discovery
+
+### kdiff3
+
+Extenral diff viewer (configurable)

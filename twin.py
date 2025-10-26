@@ -141,6 +141,7 @@ import collections
 import ctypes
 import datetime
 import errno
+import json
 import logging
 import os
 import platform
@@ -296,7 +297,10 @@ def setup_logger(logger):
 
     return logger
 
-def platform_is_win32():
+def platform_is_32bit():
+    """
+    Return true if platform is 32bit
+    """
     return (platform.architecture()[0] == "32bit")
 
 def os_path_physpath(path):
@@ -403,8 +407,15 @@ def os_copy(filepath, target_dir):
     else:
         shutil.copy2(filepath, target_dir)
 
-def xrange(list_or_int):
-    return __builtin__.xrange(list_or_int if isinstance(list_or_int, int) else len(list_or_int))
+def xrange(list_or_int_start_stop, list_or_int_stop=None, step=None):
+    def len_or_int(l):
+        return l if isinstance(l, int) else len(l)
+
+    if (list_or_int_stop is None):
+        return __builtin__.xrange(len_or_int(list_or_int_start_stop))
+
+    else:
+        return __builtin__.xrange(len_or_int(list_or_int_start_stop), len_or_int(list_or_int_stop), step)
 
 def index_of(l, item):
     try:
@@ -1357,14 +1368,13 @@ LOCALSEND_MULTICAST_GROUP = '224.0.0.167'
 LOCALSEND_MULTICAST_PORT = 53317
 LOCALSEND_HTTP_PORT = 53317
 LOCALSEND_API_BASE = '/api/localsend/v2'
-
+LocalsendDevice = collections.namedtuple("LocalsendDevice", "alias, version, deviceModel, deviceType, fingerprint, host, port, protocol, download")
 def localsend_discover_devices(timeout):
     import uuid
-    import json
     import socket
     import threading
 
-    Device = collections.namedtuple("Device", "alias, version, deviceModel, deviceType, fingerprint, host, port, protocol, download")
+    listener_started = threading.Event()
 
     def make_fingerprint():
         # XXX This should be the sha256 of this peer's HTTPS server certificate,
@@ -1380,11 +1390,12 @@ def localsend_discover_devices(timeout):
         """
         start = time.time()
         fingerprints = set()
+        listener_started.set()
         while True:
             try:
-                logger.info("recvfromming")
+                logger.info("recvfromming for %d/%d secs", sock.gettimeout(), timeout)
                 data, addr = sock.recvfrom(4096)
-                logger.info("recvfrommed")
+                logger.info("recvfrommed %s %s bytes", addr, len(data) if data is not None else 0)
                 # Parse the response JSON
                 try:
                     resp = json.loads(data)
@@ -1418,7 +1429,7 @@ def localsend_discover_devices(timeout):
                     continue
 
                 # Add the device to the list of discovered devices
-                dev = Device(
+                dev = LocalsendDevice(
                     alias=resp.get('alias'),
                     version=resp.get('version'),
                     deviceModel=resp.get('deviceModel'),
@@ -1434,14 +1445,14 @@ def localsend_discover_devices(timeout):
                 fingerprints.add(dev.fingerprint)
                 
             except socket.timeout:
-                logger.info("socket timeout")
+                logger.info("socket %d secs timeout hit", sock.gettimeout())
 
             except Exception as e:
                 logger.error("socket exception %s", e)
                 
             # Stop after the timeout duration
             if ((time.time() - start) > timeout):
-                logger.info("global timeout, finishing")
+                logger.info("global timeout %d secs, finishing", timeout)
                 break
 
     def send_announcement(myinfo, sock):
@@ -1465,34 +1476,68 @@ def localsend_discover_devices(timeout):
         - One to listen for responses
         - One to send the announcement
 
-        1.17 protocol 2.1 on samsung never responds to announcements, only sends
-            announcements when starting the app, refreshing, etc
+        You need to quit the Localsend app / stop the Localsend app server on
+        the local machine.
 
-        1.10 protocol 2.0 on hd tablet, desktop responds ok
+        - Self announcement is received a few ms after sent
+        - 1.17 protocol 2.1 on samsung responds multiple times, 1s after
+          announcement, 254 bytes
+        - 1.10 protocol 2.0 on hd tablet responds single time, 2s after
+          announcement, 247 bytes
         """
         devices = []
 
-        # Create a UDP socket for receiving responses
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        # Set a small timeout so the loop has fine granularity when checking the
-        # global timeout
-        sock.settimeout(timeout * 0.1)
+        hostname, alias_list, ips = socket.gethostbyname_ex(socket.gethostname())
 
-        # Bind the socket to the multicast group
-        sock.bind(('', LOCALSEND_MULTICAST_PORT))
-        mreq = struct.pack("4sl", socket.inet_aton(LOCALSEND_MULTICAST_GROUP), socket.INADDR_ANY)
-        sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+        # Listening on all interfaces and using as IP_ADD_MEMBERSHIP INADDR_ANY
+        # sometimes causes responses not to be received on Windows 10 with wifi
+        # and wired interfaces (even if wifi is "Media Disconnected" as per
+        # "ipconfig"), stating the interface explicitly seems to fix it
+        for ip in ips:
+            # Create a UDP socket for receiving responses
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            # Set a small timeout so the loop has fine granularity when checking the
+            # global timeout, but not too small that responses are not received (the
+            # symptom is that the Localsend app on the local machine is discovered,
+            # but not other machines)
+            sock.settimeout(5)
 
-        # Start the listener thread
-        listener_thread = threading.Thread(target=listen_for_responses_udp, args=(sock, myinfo, devices, timeout))
-        listener_thread.start()
+            # Bind the socket to the multicast group in all the interfaces
+            logger.info("Binding listener socket to %s", ip)
+            sock.bind((ip, LOCALSEND_MULTICAST_PORT))
+            # mreq = struct.pack("4sl", socket.inet_aton(LOCALSEND_MULTICAST_GROUP), socket.INADDR_ANY)
+            mreq = struct.pack("4s4s", socket.inet_aton(LOCALSEND_MULTICAST_GROUP), socket.inet_aton(ip))
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
 
-        # Send the multicast announcement
-        retries = 2
+            # Start the listener thread
+            timeout = 15
+            listener_thread = threading.Thread(target=listen_for_responses_udp, args=(sock, myinfo, devices, timeout))
+            listener_thread.start()
+
+        # Wait for the thread to start to send the announcements, trying to
+        # prevent the announcement and response from happening before the
+        # listener starts. More a heuristic than anything, since there's no
+        # telling when thread context switches happen
+        # XXX There could be multiple if multiple ips, fix
+        listener_started.wait()
+
+        # Send a few multicast announcements while the listener thread is running
+        retries = 3
+        logger.info("hostname %s alias_list %s ips %s", hostname, alias_list, ips)
         for _ in xrange(retries):
-            logger.info("Sending announcement")
-            send_announcement(myinfo, sock)
+            # Send via a specific interface, otherwise INADDR_ANY multicast
+            # send  will fail when there are multiple interfaces even if only
+            # a single interface is enabled (eg wifi and wired where Windows has
+            # disabled wifi because of wired). The symptom is that it fails to
+            # discover any, possibily because the announcement never arrived
+            for ip in ips:
+                # See https://stackoverflow.com/questions/10702870/how-to-multicast-send-to-all-network-interfaces
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+                sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(ip))
+                
+                logger.info("Sending announcement via %s", ip)
+                send_announcement(myinfo, sock)
             time.sleep(timeout * 1.0/retries)
 
         # Wait for the listener thread to finish
@@ -1502,8 +1547,9 @@ def localsend_discover_devices(timeout):
         return devices
 
     fingerprint = make_fingerprint()
+    # XXX Convert to LocalsendDevice for consistency?
     myinfo = {
-        'alias': 'PythonSender',
+        'alias': 'Twin ' + APPLICATION_VERSION,
         'version': '2.1',
         'deviceModel': 'Python',
         'deviceType': 'desktop',
@@ -1518,7 +1564,6 @@ def localsend_discover_devices(timeout):
 
 def localsend_upload_to_device(myinfo, device, filepath):
     import httplib
-    import json
     import ssl
     timeout = 10
     
@@ -1623,6 +1668,10 @@ def localsend_upload_to_device(myinfo, device, filepath):
 
     return result
 
+# major.minor.patch
+APPLICATION_VERSION = "0.0.1"
+CONFIG_FILE_VERSION = "0.0.1"
+
 INCLUDE_DIR = "include"
 TEMP_DIR = os.path.join("_out", "temp")
 
@@ -1630,13 +1679,13 @@ TEMP_DIR = os.path.join("_out", "temp")
 IMAGE_EXTENSIONS = ('.bmp','.enc','.gif', '.jpg', '.jpeg', '.jfif', '.png', '.webp')
 FILTERED_EXTENSIONS = []
 # See https://www.7-zip.org/
-# Note removed ".bz2" so it uses ghisler bzip2dll for testing
-# Note removed ".zip" so it uses native support
-# Note removed ".iso" so it uses iso.wcx64 for testing
-PACKER_7ZIP_EXTENSIONS = (".7z", ".xz", ".gz", ".tar", ".tgz", ".wim") 
+# Note remove ".bz2" so it uses ghisler bzip2dll for testing
+# Note remove ".zip" so it uses native support
+# Note remove ".iso" so it uses iso.wcx64 for testing
+PACKER_7ZIP_EXTENSIONS = (".7z", ".xz", ".gz", ".tar", ".tgz", ".wim", "bz2") 
 PACKER_7ZIP_EXTENSIONS_UNPACK_ONLY = (".apfs", ".ar", ".arg", ".cab", ".chm", 
     ".cpio", ".cramfs", ".deb", ".dmg", ".ext", ".fat", ".gpt", ".hfs", "ihex", 
-    ".lzh", ".lzma", ".mbr", ".msi", ".nsis", ".ntfs", ".qcow2", ".rar", 
+    ".iso", ".lzh", ".lzma", ".mbr", ".msi", ".nsis", ".ntfs", ".qcow2", ".rar", 
     ".rpm", ".squashfs", ".udf", ".uefi", ".vdi", ".vhd", ".vhdx", ".vmdk", ".xar", 
     ".z")
 # See https://totalcmd.net/plugring/total7zip.html
@@ -1644,6 +1693,10 @@ PACKER_7ZIP_EXTENSIONS_UNPACK_ONLY = (".apfs", ".ar", ".arg", ".cab", ".chm",
 #     extensions, etc, use it?
 TOTAL7ZIP_EXTENSIONS = PACKER_7ZIP_EXTENSIONS + PACKER_7ZIP_EXTENSIONS_UNPACK_ONLY
 PACKER_EXTENSIONS = (".iso",".bz2")  + TOTAL7ZIP_EXTENSIONS
+
+EXTERNAL_VIEWER_FILEPATH = R"C:\Program Files\totalcmd\TOTALCMD%s.EXE" % ("" if platform_is_32bit() else "64")
+
+EXTERNAL_DIFF_FILEPATH = R"C:\Program Files\KDiff3\kdiff3.exe"
 
 # Size of the thumbnails stored in the model
 IMAGE_WIDTH = 256
@@ -1701,23 +1754,42 @@ use_incremental_row_loading = False
 #     requests
 use_everything = False
 
-# Force all listings to be single thread, this simplifies debugging
+# Set to force all listings to be single thread, this simplifies debugging
 force_single_thread = False
+
+# Force Everything listings single thread (Everything is actually single thread 
+# and will actually block other processes until that query is done)
+# XXX When this is False there's a race condition in Everything and
+#     CTypesHelper that causes c.Everything_GetResultDateModified to to use the
+#     wrong FILETIME pointer?
+force_everything_single_thread = True
+
+# Currently this must be set to true at least for sftpplug, otherwise listing
+# will work but extract will fail with error 3 (FS_FILE_READERROR), since the
+# first happens on a worker thread and the second on the UI thread. By setting
+# to True everything happens on the UI thread.
+#
 # WFX plugins have flags for multithread (even if the calls are not made
 # simultanously they are made from different threads), they may also be
 # thread-affine (may expect to run from the thread that initialized it), set to
-# True to call it serially from the UI thread
-# XXX In the future have a thread per WFX or for all WFX if necessary?
+# True to call it serially from the UI thread 
+#
+# XXX In the future have a thread per WFX or for all WFX if necessary? 
+#
 # XXX This is also the case for WCX?
-force_wfx_single_thread = False
+force_wfx_single_thread = True
 
 # Run ctypes parsing tests
 do_parse_test = False
 
-# Cached localsend information
-# XXX Store this in configuration
+# Cached localsend information, defaults retrieved from the configuration
 g_localsend_devices = []
 g_localsend_myinfo = None
+
+# These are read initialized to the constants and later read from the config
+# file
+g_external_viewer_filepath = EXTERNAL_VIEWER_FILEPATH
+g_external_diff_filepath = EXTERNAL_DIFF_FILEPATH
 
 def qFindMainWindow():
     for widget in qApp.topLevelWidgets():
@@ -2103,7 +2175,7 @@ class EverythingFileInfoIterator(FileInfoIterator):
         
         # On XP 32-bit there's a warning when WinDLL cannot load a DLL, don't
         # load 64 bit and fallback to 32, check 32 bit explicitly
-        if (platform_is_win32()):
+        if (platform_is_32bit()):
             everything_dll = ctypes.WinDLL(R"_out\Everything32.dll")
 
         else:
@@ -3561,18 +3633,58 @@ def safe_unicode(s):
         return unicode(s)
 
 
-class CheckablePopupMenu(QMenu):
+class EditablePopupMenu(QMenu):
     """
-    Popup menu that can be checked/unchecked via ctrl+click or spacebar without
-    those causing the menu to close
+    Popup menu that
+    - can be checked/unchecked, via ctrl+click or spacebar 
+    - options can be deleted via DEL
+    without those causing the menu to close
     """
-    def __init__(self, parent=None):
-        super(CheckablePopupMenu, self).__init__(parent)
+    def __init__(self, parent=None, allow_delete = False, allow_check = True):
+        """
+        A global allow_check is arguably redundant since menu options already
+        have setCheckable, but sometimes a check mark is desired as visual
+        indicator even if allow_check is false, and setCheckable is necessary
+        since otherwise setChecked is ignored
+        """
+        # XXX Should allow passing a minimum number of undeleted options? (some
+        #     callers allow deleting all, some must leave at least one
+        #     undeleted?)
+        super(EditablePopupMenu, self).__init__(parent)
+        self.allow_delete = allow_delete
+        self.allow_check = allow_check
+        self.next_number = 0
+        # Note this is in deletion order, the caller may need to sort it reverse
+        # if holding indices and removing entries from an array
+        self.deleted_datas = []
+    
+    def addAction(self, title, data=None, auto_number=False):
+        logger.info("%s", title)
+
+        if (auto_number):
+            shortcuts = string.digits + string.ascii_uppercase
+            title = "&%s. %s" % (shortcuts[self.next_number], title)
+            self.next_number += 1
+
+        action = super(EditablePopupMenu, self).addAction(title)
+        action.setData(data)
+        return action
+
+    def exec_(self, pos):
+        logger.info("")
+
+        # The menu pops up without an action active, set one
+        self.setActiveAction(self.actions()[0])
+        # The menu doesn't grab the keyboard focus when first displayed until a
+        # cursor key is pressed. If the first key is space this causes the key
+        # to go to the parent widget, which is wrong, force a focus
+        self.setFocus()
+        return super(EditablePopupMenu, self).exec_(pos)
 
     def keyPressEvent(self, event):
         logger.info("%r", event)
         # Check if the pressed key is the spacebar
-        if (event.key() == Qt.Key_Space):
+        if ((event.key() == Qt.Key_Space) and self.allow_check):
             # Get the currently active/highlighted action in the menu
             active_action = self.activeAction()
             if (active_action and active_action.isCheckable()):
@@ -3580,14 +3692,25 @@ class CheckablePopupMenu(QMenu):
                 active_action.setChecked(not active_action.isChecked())
                 event.accept()
                 return
+                
+        elif ((event.key() == Qt.Key_Delete) and self.allow_delete):
+            active_action = self.activeAction()
+            data = active_action.data()
+            if (data is not None):
+                i = index_of(self.actions(), active_action)
+
+                self.deleted_datas.append(data)
+                self.removeAction(active_action)
+                # Focus on the next action
+                self.setActiveAction(self.actions()[min(i, len(self.actions())-1)])
         
         # For all other key events, let the base class handle them
-        super(CheckablePopupMenu, self).keyPressEvent(event)
+        super(EditablePopupMenu, self).keyPressEvent(event)
 
     def mousePressEvent(self, event):
         logger.info("%r", event)
 
-        if ((event.button() == Qt.LeftButton) and (event.modifiers() & Qt.ControlModifier)):
+        if (((event.button() == Qt.LeftButton) and (event.modifiers() & Qt.ControlModifier)) and self.allow_check):
             # Get the currently active/highlighted action in the menu
             active_action = self.activeAction()
             if (active_action and active_action.isCheckable()):
@@ -3595,7 +3718,7 @@ class CheckablePopupMenu(QMenu):
                 event.accept()
                 return
 
-        super(CheckablePopupMenu, self).mousePressEvent(event)
+        super(EditablePopupMenu, self).mousePressEvent(event)
 
 
 class DirectoryReader(QThread):
@@ -3941,7 +4064,7 @@ class DirectoryModel(QAbstractTableModel):
         #     state that remembers which iterator it came from or a hint of what
         #     iterator to try first?
 
-        dllext = ".wfx" if platform_is_win32() else ".wfx64"
+        dllext = ".wfx" if platform_is_32bit() else ".wfx64"
         wfx_infos = [
             WFXInfo(SHARE_ROOT + "\\webdav", R"_out\davplug\davplug" + dllext),
             WFXInfo(SHARE_ROOT + "\\sftp", R"_out\sftpplug\sftpplug" + dllext) ,
@@ -4000,7 +4123,7 @@ class DirectoryModel(QAbstractTableModel):
             dirpath = file_dir[len(arcpath):]
             ext_lower = os.path.splitext(arcpath)[1].lower()
 
-            dllext = ".wcx" if platform_is_win32() else ".wcx64"
+            dllext = ".wcx" if platform_is_32bit() else ".wcx64"
 
             # XXX Refactor below into table
             # XXX Fix for 32-bit, pass multiple DLLs? preload the DLL?
@@ -4069,7 +4192,10 @@ class DirectoryModel(QAbstractTableModel):
         # XXX Is self.it ever None?
         self.directoryReader = DirectoryReader(self.file_dir, 500 if insert_only else 0, it=self.it, loop=True if (self.it is None) else loop)
         self.directoryReader.direntryRead.connect(receive_direntry)
-        single_thread = (force_single_thread or (force_wfx_single_thread and isinstance(self.it, WFXFileInfoIterator)))
+        single_thread = (force_single_thread or 
+            (force_wfx_single_thread and isinstance(self.it, WFXFileInfoIterator)) or
+            (force_everything_single_thread and isinstance(self.it, EverythingFileInfoIterator))
+        )
         self.directoryReader.start(single_thread)
 
     def calculateSubdirSizes(self, subdir_index=QModelIndex()):
@@ -4646,7 +4772,7 @@ class DirectoryModel(QAbstractTableModel):
 
         if (role == Qt.DisplayRole):            
             # XXX Should this take the basename at least for index 0 (listview)
-            #     in case the fileanme is a deep relative path or absoulte
+            #     in case the filename is a deep relative path or absolute
             #     because of coming from Everyting or some search? But elision
             #     should fix this?
             
@@ -4730,7 +4856,7 @@ class DirectoryModel(QAbstractTableModel):
         elif (role == Qt.UserRole):
             return file_info
         
-        elif role == Qt.DecorationRole:
+        elif (role == Qt.DecorationRole):
             file_name = file_info.filename
             filepath = os.path.join(self.file_dir, file_name)
             key = filepath
@@ -5021,7 +5147,7 @@ class ScaledIconDelegate(QStyledItemDelegate):
         
     def sizeHint(self, option, index):
         # See https://github.com/qt/qtbase/blob/5.3/src/widgets/itemviews/qstyleditemdelegate.cpp#L463
-        logger.debug("decorationSize %r", option.decorationSize)
+        logger.debug("decorationSize %r row %d col %d", option.decorationSize, index.row(), index.column())
         # This is a very hot path, needs to cache or precalculate, otherwise
         # the inherited sizeHint takes seconds in the profiler
         if (self.size is None):
@@ -5040,6 +5166,10 @@ class ScaledIconDelegate(QStyledItemDelegate):
 
             # Override the decorationSize with the requested size
             opt.decorationSize = QSize(self.width, self.width)
+            # Override the text with empty, text will be elided so don't want
+            # sizeFromContents to look at the text to calculate the size since
+            # it would enlarge the size beyond the icon size
+            opt.text = ""
 
             #return style->sizeFromContents(QStyle::CT_ItemViewItem, &opt, QSize(), widget);
             size = style.sizeFromContents(QStyle.CT_ItemViewItem, opt, QSize(), widget)
@@ -5216,13 +5346,15 @@ class FileTableView(QTableView):
         return super(FileTableView, self).selectionCommand(index, event)
 
 class FilePane(QWidget):
-    def __init__(self, *args, **kwargs):
+    directoryLabelChanged = pyqtSignal(str)
+    def __init__(self, display_width = DISPLAY_WIDTH, *args, **kwargs):
         logger.info("")
         super(FilePane, self).__init__(*args, **kwargs)
 
         self.dir_history = []
         self.current_dir_history = -1
         self.search_mode = False
+        self.old_file_dir = None
 
         self.search_string = ""
         self.search_string_display_ms = SEARCH_STRING_DISPLAY_TIME_MS
@@ -5230,7 +5362,7 @@ class FilePane(QWidget):
         self.search_string_timer.setSingleShot(True)
         self.search_string_timer.timeout.connect(self.resetSearchString)
 
-        self.DISPLAY_WIDTH = DISPLAY_WIDTH
+        self.display_width = display_width
 
         self.file_dir = None
 
@@ -5258,14 +5390,16 @@ class FilePane(QWidget):
         self.list_view_style = FixedWidthStyle()
         #self.list_view.setStyle(self.list_view_style)
         #self.list_view.setGridSize(QSize(DISPLAY_WIDTH, DISPLAY_HEIGHT+20))
-        # setUniformItemSizes is important so past items are note data() which
+
+        # setUniformItemSizes is important so past items are not data()ed, which
         # kills the LRU cache. ListViewPrivate::itemSize uses it to prevent
-        # calling the delegate. Unforunately this requires doing elision in the 
-        # Using a delegate avoids having to do elision in the model's data() 
+        # calling the delegate. Unfortunately this requires doing elision in the
+        # model. Using a delegate avoids having to do elision in the model's
+        # data() 
         if (use_delegate):
             delegate = ScaledIconDelegate(self.list_view)
-            delegate.setWidth(self.DISPLAY_WIDTH)
-            self.list_view_style.setWidth(self.DISPLAY_WIDTH)
+            delegate.setWidth(self.display_width)
+            self.list_view_style.setWidth(self.display_width)
             self.list_view.setItemDelegate(delegate)
             self.list_view.setSpacing(10)
             self.list_view.setTextElideMode(Qt.ElideMiddle)
@@ -5384,8 +5518,7 @@ class FilePane(QWidget):
             menu = QMenu()
             for col in xrange(model.columnCount()):
                 header = model.headerData(col, Qt.Horizontal)
-                action = menu.addAction(header)
-                action.setData(col)
+                action = menu.addAction(header, col)
                 action.setCheckable(True)
                 action.setChecked(not table.isColumnHidden(col))
             
@@ -5661,6 +5794,12 @@ class FilePane(QWidget):
             self.directory_label.setEnabled(True)
             self.directory_label.setText(elided_dir)
 
+        label_text = ("search:" + self.search_string) if self.search_mode else self.model.file_dir
+        # Don't emit None as it will crash silently
+        # XXX file_dir is None at initialization because of the two step
+        #     initialization performed when starting the app, fix?
+        self.directoryLabelChanged.emit(label_text or "")
+
     def updateSummary(self):
         logger.info("Starting")
 
@@ -5804,12 +5943,12 @@ class FilePane(QWidget):
             # spacebar selection be less disruptive when search is on, while at
             # the same time allowing spaces in search strings
             if (old_search_string.rstrip() != self.search_string.rstrip()):
-                qDebounceCall(self.searchEverything, 750)
+                qDebounceCall(self.searchEverything, 1000)
 
     def searchEverything(self):
         try:
             self.model.setSearchString(self.file_dir)
-
+            
         except Exception as e:
             QMessageBox.critical(
                 self, "Search Mode", "Can't switch to search mode, error '%s'" % e,
@@ -5845,7 +5984,7 @@ class FilePane(QWidget):
 
         self.pasteFilesAct = QAction('Paste from Clipboard', self, shortcut="ctrl+v", triggered=self.pasteClipboardFiles, shortcutContext=Qt.WidgetWithChildrenShortcut)
 
-        self.changeDirAct = QAction('Change Directory', self, shortcut="ctrl+d", triggered=self.changeDirectory, shortcutContext=Qt.WidgetWithChildrenShortcut)
+        self.openDirAct = QAction('Open Directory', self, shortcut="ctrl+o", triggered=self.openDirectory, shortcutContext=Qt.WidgetWithChildrenShortcut)
         # XXX Network Directory could request a network address to download eg
         #     http:// and default to the Network pseudo directory
         self.networkDirAct = QAction('Network Directory', self, shortcut="ctrl+n", triggered= lambda : self.setDirectory(SHARE_ROOT), shortcutContext=Qt.WidgetWithChildrenShortcut)
@@ -5873,7 +6012,7 @@ class FilePane(QWidget):
         self.increaseIconSizeAct = QAction('Increase Icon Size', self, shortcut="ctrl++", triggered=lambda : self.resizeIcons(16), shortcutContext=Qt.WidgetWithChildrenShortcut)
         self.decreaseIconSizeAct = QAction('Decrease Icon Size', self, shortcut="ctrl+-", triggered=lambda : self.resizeIcons(-16), shortcutContext=Qt.WidgetWithChildrenShortcut)
         
-        self.switchViewAct = QAction("Switch View", self, shortcut="ctrl+t", triggered=self.switchView, shortcutContext=Qt.WidgetWithChildrenShortcut)
+        self.switchViewAct = QAction("Switch View", self, shortcut="ctrl+i", triggered=self.switchView, shortcutContext=Qt.WidgetWithChildrenShortcut)
 
         self.selectAndAdvanceAct = QAction("Select and Advance", self, shortcut="insert", triggered=self.selectAndAdvance, shortcutContext=Qt.WidgetWithChildrenShortcut)
         self.invertSelectionAct = QAction("Invert Selection", self, shortcut="ctrl+b", triggered=self.invertSelection, shortcutContext=Qt.WidgetWithChildrenShortcut)
@@ -5890,7 +6029,7 @@ class FilePane(QWidget):
         self.addAction(self.deleteFilesAct)
         self.addAction(self.pasteFilesAct)
         self.addAction(self.localsendFilesAct)
-        self.addAction(self.changeDirAct)
+        self.addAction(self.openDirAct)
         self.addAction(self.networkDirAct)
         self.addAction(self.reloadDirAct)
         self.addAction(self.parentDirAct)
@@ -5974,8 +6113,6 @@ class FilePane(QWidget):
 
     def openInExternalViewer(self):
         logger.info("")
-        editor_filepath = R"C:\Program Files\totalcmd\TOTALCMD%s.EXE" % ("" if platform_is_win32() else "64")
-
         def cleanup_temp_file(temp_relpath, filepath):
             logger.info("%r %r", temp_relpath, filepath)
             def remove_leaf(relpath):
@@ -6020,7 +6157,7 @@ class FilePane(QWidget):
                 #     cleanup?
                 temp_relpath = os.path.relpath(filepath, TEMP_DIR)
                 p.finished.connect(lambda : cleanup_temp_file(temp_relpath, filepath))
-                p.start(editor_filepath, arguments)
+                p.start(g_external_viewer_filepath, arguments)
             else:
                 QMessageBox.warning(
                     self, "View File", "Error viewing file '%r'" % filename,
@@ -6033,16 +6170,16 @@ class FilePane(QWidget):
             filepath = os.path.abspath(os.path.join(self.file_dir, filename))
             arguments = ["/S=L", filepath]
             # Start detached will create an independent process instead of a child
-            QProcess().startDetached(editor_filepath, arguments)
+            QProcess().startDetached(g_external_viewer_filepath, arguments)
             
     def resizeIcons(self, delta):
-        logger.info("%d + %d", self.DISPLAY_WIDTH, delta)
-        new_width = max(64, self.DISPLAY_WIDTH + delta)
-        if (new_width != self.DISPLAY_WIDTH):
+        logger.info("%d + %d", self.display_width, delta)
+        new_width = max(64, self.display_width + delta)
+        if (new_width != self.display_width):
             if (use_delegate):
-                self.DISPLAY_WIDTH, self.DISPLAY_HEIGHT = new_width, new_width
-                self.list_view.itemDelegate().setWidth(self.DISPLAY_WIDTH)
-                self.list_view_style.setWidth(self.DISPLAY_WIDTH)
+                self.display_width = new_width
+                self.list_view.itemDelegate().setWidth(self.display_width)
+                self.list_view_style.setWidth(self.display_width)
                 
             else:
                 # XXX Make this app or even listview local (or use the iconSize
@@ -6175,18 +6312,33 @@ class FilePane(QWidget):
 
     def chooseHistoryDirectory(self):
         logger.info("")
-        menu = QMenu()
+        menu = EditablePopupMenu(self.parent(), allow_check=False, allow_delete=True)
         for i, history_entry in enumerate(reversed(self.dir_history)):
             # XXX Skip duplicated entries?
-            action = menu.addAction(history_entry)
+            # XXX Allow ctrl+ to goto in a new tab? Needs to move method to app
             i = len(self.dir_history) - i - 1
-            action.setData(i)
+            action = menu.addAction(history_entry, i, True)
             action.setCheckable(True)
             action.setChecked(i == self.current_dir_history)
+        menu.addSeparator()
+        openAct = menu.addAction("Open...")
+        clearAct = menu.addAction("Clear all")
         
         action = menu.exec_(self.directory_label.mapToGlobal(self.directory_label.rect().bottomLeft()))
-        if (action is not None):
+        if (action is openAct):
+                self.openDirectory()
+                
+        elif (action is clearAct):
+            self.dir_history = [self.dir_history[self.current_dir_history]]
+            self.current_dir_history = 0
+            menu.deleted_datas = []
+
+        elif (action is not None):
             self.gotoHistoryDirectory(action.data() - self.current_dir_history)
+
+        # Delete history entries, last first to preserve index validity
+        for history_index in sorted(menu.deleted_datas, reverse=True):
+            del self.dir_history[history_index]
 
     def isForciblyBrowsable(self, file_info):
         """
@@ -6638,7 +6790,8 @@ class FilePane(QWidget):
             qFindMainWindow().updateWindowTitle()
         
         elif ((source is self.directory_label) and (event.type() == QEvent.MouseButtonRelease)):
-            self.changeDirectory()
+            # XXX Do chooseBookmark if right click
+            self.chooseHistoryDirectory()
 
         elif ((event.type() == QEvent.KeyPress) and (self.search_string != "") and 
               ((event.key() in [Qt.Key_Backspace] + ([] if self.search_mode else [Qt.Key_Up, Qt.Key_Down])))):
@@ -6806,12 +6959,12 @@ class FilePane(QWidget):
             if (self.model.canFetchMore(QModelIndex())):
                self.model.fetchMore(QModelIndex())
         
-    def changeDirectory(self):
+    def openDirectory(self):
         logger.info("Requesting new directory default is %r", self.file_dir)
         # XXX Disable the action when use_everything? or just switch back to
         #     directory mode? Note this is also called explicitly, so disabling
         #     the action is not enough, also needs to be ignored here
-        # XXX Have changeDirectory use the header bar to type the new directory
+        # XXX Have openDirectory use the header bar to type the new directory
         #     instead of popping a dialog box? (but the dialog box is a
         #     directory dialog box which is sometimes convenient, also the
         #     header would need better editing support)
@@ -6820,7 +6973,6 @@ class FilePane(QWidget):
             if (file_dir != ""):
                 self.setDirectory(file_dir)
 
-            
     def reloadDirectory(self, clear_cache=False):
         logger.info("clar_cache %s", clear_cache)
         # XXX This doesn't update the view sometimes, eg move a file into an
@@ -6889,10 +7041,14 @@ class FilePane(QWidget):
             logger.info("No files found in the clipboard.")
 
 
-    def getSelectedFilepaths(self):
+    def getSelectedFilepaths(self, strict=False):
+        """
+        Return selected filepaths or the current one if no selections and not
+        strict
+        """
         logger.info("")
         selected_filepaths = [os.path.join(self.file_dir, index.data(Qt.UserRole).filename) for index in self.getActiveView().selectionModel().selectedRows()]
-        if (len(selected_filepaths) == 0):
+        if ((len(selected_filepaths) == 0) and (not strict)):
             selected_filepaths = [os.path.join(self.file_dir, self.getActiveView().currentIndex().data(Qt.UserRole).filename)]
 
         return selected_filepaths
@@ -6935,13 +7091,18 @@ class FilePane(QWidget):
                 #     transfer fails
                 # XXX Pass a list of trusted devices, implement trust on first use,
                 #     allow
-                devices, myinfo = localsend_discover_devices(5)
+                # XXX This should pass the existing g_localsend_myinfo
+                devices, myinfo = localsend_discover_devices(10)
                 qApp.restoreOverrideCursor()
 
-                # XXX Store devices in ini file
                 g_localsend_myinfo = myinfo
                 for device in devices:
-                    if (device.host not in [d.host for d in g_localsend_devices]):
+                    # If the device is found, replace it in case it was found
+                    # with a different ip, otherwise append
+                    i = index_of([d.host for d in g_localsend_devices], device.host)
+                    if (i != -1):
+                        g_localsend_devices[i] = device
+                    else:
                         g_localsend_devices.append(device)
 
                 msg_box.close()
@@ -6958,6 +7119,7 @@ class FilePane(QWidget):
                     self, "Localsend Files", 
                     "Can't find Localsend devices to send to." +
                     " Try again while at the same time, either:\n" +
+                    "- closing the Localsend app / stop the server on the local device\n" + 
                     "- restarting the Localsend app on the target device\n" +
                     "- refreshing the nearby devices on the target device Localsend app\n" + 
                     "Retry?",
@@ -6973,23 +7135,29 @@ class FilePane(QWidget):
 
                 # Set the menu to the parent so the FilePane spacebar shortcut
                 # doesn't override checking via spacebar
+                # XXX spacebar still highlights the filepane instead of checking
+                #     the menu option no matter parent() is used or
+                #     qFindMainWindow() until cursors are pressed, fix
+
                 # XXX Limit the shortcut at creation time to the table? (the
                 #     listview shouldn't have it either anyway)
-                menu = CheckablePopupMenu(self.parent())
+                menu = EditablePopupMenu(self.parent(), allow_delete=True)
+                # XXX This ignores the configuration, fix
                 g_localsend_myinfo = myinfo
                 for device in g_localsend_devices:
                     # Localsend uses the lowest byte of the IP as #id, display the same,
                     # see https://github.com/localsend/protocol/issues/30
-                    action = menu.addAction("%s #%s (%s)" % (device.alias, device.host.split(".")[-1], device.deviceModel))
-                    action.setData(device)
+                    action = menu.addAction("%s #%s (%s)" % (device.alias, device.host.split(".")[-1], device.deviceModel), device, True)
                     action.setCheckable(True)
                     action.setChecked(False)
-                action = menu.addAction("Discover Devices")
-                action.setData(None)
-                # The menu pops up without an action active, set one
-                menu.setActiveAction(menu.actions()[0])
-            
+                menu.addSeparator()
+                discoverAct = menu.addAction("Discover Devices")
+                
                 action = menu.exec_(view.viewport().mapToGlobal(pos))
+
+                for device in menu.deleted_datas:
+                    g_localsend_devices.remove(device)
+                
                 logger.info("Focus widget is %r", self.focusWidget())
                 # XXX This doesn't focus back on the table when done,
                 #     investigate and do it manually by now. focusWidget()
@@ -7001,67 +7169,67 @@ class FilePane(QWidget):
                 logger.info("Focus widget is %r", self.focusWidget())
                 if (action is None):
                     break
+
+                elif (action is discoverAct):
+                    do_discovery = True
+
                 else:
-                    if (action.data() is None):
-                        do_discovery = True
+                    # Pressing enter on an action to dismiss the menu toggles
+                    # the check, so
+                    # - If the only checked action is the selected one, this
+                    #   behaves like a regular popup menu
+                    # - If there are more than one checked actions, ignore the
+                    #   selected action
+                    devices = []
+                    for a in menu.actions():
+                        if ((a is not action) and (a.isChecked())):
+                            devices.append(a.data())
 
-                    else:
-                        # Pressing enter on an action to dismiss the menu toggles the check,
-                        # so
-                        # - If the only checked action is the selected one, this behaves
-                        #   like a regular popup menu
-                        # - If there are more than one checked actions, ignore the selected
-                        #   action
-                        devices = []
-                        for a in menu.actions():
-                            if ((a is not action) and (a.isChecked())):
-                                devices.append(a.data())
-
-                        # No non-selected actions are checked
-                        if ((len(devices) == 0) or (not action.isChecked())):
-                            devices.append(action.data())
-                        
-                        
-                        for device in devices:
-                            # XXX Send multiple files in one call, but what about directories?
-                            for filepath in self.getSelectedFilepaths():
-                                # XXX Needs dealing with directories, recurse and send name
-                                #     with relative path?
-                                if (not os.path.isdir(filepath)):
-                                    while (True):
-                                        logger.info("Localsending %r to %r", filepath, device)
-                                        # XXX Allow canceling this/all
-                                        # XXX This will fail if device needs to approve (eg
-                                        #     "save media to gallery" is set), with "Could not
-                                        #     save file. Check receiving device for more
-                                        #     information.", guard against that and offer retry? 
-                                        #     See https://github.com/localsend/localsend/issues/1591
-                                        qApp.setOverrideCursor(Qt.WaitCursor)
-                                        try:
-                                            localsend_upload_to_device(myinfo, device, filepath)
-                                            
-                                        except Exception as e:
-                                            # XXX This should have yes to all no
-                                            #     to all in case of multiple
-                                            #     files/failed devices?
-                                            res = QMessageBox.warning(
-                                                self, "Localsend Files", 
-                                                "Exception %r sending %r to device %s. Make sure the localsend app is running.\nRetry?" % 
-                                                (e, os.path.basename(filepath), device.alias),
-                                                buttons=QMessageBox.Yes|QMessageBox.No|QMessageBox.Cancel,
-                                                # Set it explicitly. Despite what docs say, the default is Yes
-                                                defaultButton=QMessageBox.Yes
-                                            )
-                                            if (res == QMessageBox.Yes):
-                                                continue
+                    # No non-selected actions are checked
+                    if ((len(devices) == 0) or (not action.isChecked())):
+                        devices.append(action.data())
+                    
+                    
+                    for device in devices:
+                        # XXX Send multiple files in one call, but what about directories?
+                        for filepath in self.getSelectedFilepaths():
+                            # XXX Needs dealing with directories, recurse and send name
+                            #     with relative path?
+                            if (not os.path.isdir(filepath)):
+                                while (True):
+                                    logger.info("Localsending %r to %r", filepath, device)
+                                    # XXX Allow canceling this/all
+                                    # XXX This will fail if device needs to approve (eg
+                                    #     "save media to gallery" is set), with "Could not
+                                    #     save file. Check receiving device for more
+                                    #     information.", guard against that and offer retry? 
+                                    #     See https://github.com/localsend/localsend/issues/1591
+                                    qApp.setOverrideCursor(Qt.WaitCursor)
+                                    try:
+                                        localsend_upload_to_device(myinfo, device, filepath)
                                         
-                                        finally:
-                                            qApp.restoreOverrideCursor()
+                                    except Exception as e:
+                                        # XXX This should have yes to all no
+                                        #     to all in case of multiple
+                                        #     files/failed devices?
+                                        res = QMessageBox.warning(
+                                            self, "Localsend Files", 
+                                            "Exception %r sending %r to device %s. Make sure the localsend app is running.\nRetry?" % 
+                                            (e, os.path.basename(filepath), device.alias),
+                                            buttons=QMessageBox.Yes|QMessageBox.No|QMessageBox.Cancel,
+                                            # Set it explicitly. Despite what docs say, the default is Yes
+                                            defaultButton=QMessageBox.Yes
+                                        )
+                                        if (res == QMessageBox.Yes):
+                                            continue
+                                    
+                                    finally:
+                                        qApp.restoreOverrideCursor()
 
-                                        break
-                                            
-                        break
-                
+                                    break
+                                        
+                    break
+            
     def copySelectedFilepaths(self):
         # XXX Another way of copying filepaths that some apps understand (eg
         #     Total Commander, Everything) is to set the filename, with metadata
@@ -7180,9 +7348,16 @@ class FilePane(QWidget):
 
 
 class TwinWindow(QMainWindow):
-    def __init__(self, left_file_dir, right_file_dir):
+    def __init__(self, left_file_dir=None, right_file_dir=None):
+        global g_localsend_myinfo
+        global g_external_viewer_filepath
+        global g_external_diff_filepath
+
         super(TwinWindow, self).__init__()
-        self.resize(1280, 1080)
+        
+        # XXX Forcing ini file for the time being for ease of debugging and
+        #     tweaking, eventually move to native
+        self.settings = QSettings('twin.ini', QSettings.IniFormat)
 
         self.setupActions()
 
@@ -7191,13 +7366,113 @@ class TwinWindow(QMainWindow):
         splitter = QSplitter(Qt.Horizontal)
         self.splitter = splitter
         
-        self.file_panes = []
-        for i in xrange(2):
-            file_pane = FilePane()
+        # XXX Missing setting different accent color to match directory accent
+        #     color?
+        # XXX Missing tab reordering via drag and drop
+        self.left_tab = QTabWidget(self)
+        self.right_tab = QTabWidget(self)
 
-            self.file_panes.append(file_pane)
-            splitter.addWidget(file_pane)
+        for tab in [self.left_tab, self.right_tab]:
+            splitter.addWidget(tab)
+            # XXX Only on 5.4+ 
+            # tab.setTabBarAutoHide(True)
+            # Don't elide, just scroll since it exhibits better UX
+            #tab.setElideMode(Qt.ElideMiddle)
 
+        self.left_panes = []
+        self.right_panes = []
+
+        # Recreate left and right tabs, restore dirs after the app has shown
+        
+        # XXX This two-step creation causes parts of the code to receive None
+        #     file_dir like updateDirectoryLabel which until worked around would
+        #     cause a silent crash in directoryLabelChanged emitting None, maybe
+        #     others fix?
+        settings = self.settings
+        file_dirs_panes = []
+
+        # Root items on ini files will go in the "General" group, trying to use
+        # "general" as a group will be escaped into "#general". Just use the
+        # root group for simplicity
+        current_pane = settings.value("current_pane", "left")
+
+        self.setGeometry(settings.value("window_geometry", QRect(0,0,1024,768)))
+
+        g_external_viewer_filepath = settings.value("external_viewer_filepath", g_external_viewer_filepath)
+        g_external_diff_filepath = settings.value("external_diff_filepath", g_external_diff_filepath)
+
+        # Note QSettings child/key enumeration doesn't guarantee a specific
+        # order, use beginWriteArray/beginReadArray for all settings that
+        # require preserve ordering (bookmarks, tabs, history, etc)
+
+        self.bookmarks = []
+        count = settings.beginReadArray("bookmarks")
+        for i in xrange(count):
+            settings.setArrayIndex(i)
+            self.bookmarks.append(settings.value("dirpath"))
+        settings.endArray()
+
+        for tab_name in ["left", "right"]:
+            settings.beginGroup(tab_name)
+            tab = self.left_tab if (tab_name == "left") else self.right_tab 
+
+            count = settings.beginReadArray("tabs")
+            for i in xrange(count):
+                logger.info("Restoring tab %s pane %s", tab_name, i)
+                settings.setArrayIndex(i)
+                file_dir = settings.value("dirpath")
+                display_width = int(settings.value("display_width", DISPLAY_WIDTH))
+                file_pane = self.createPane(tab, display_width)
+
+                if (settings.value("mode") == "thumbnails"):
+                    file_pane.switchView()
+
+                count = settings.beginReadArray("history")
+                for j in xrange(count):
+                    logger.info("Restoring tab %s pane %s history %s", tab_name, i, j)
+                    settings.setArrayIndex(j)
+                    file_pane.dir_history.append(settings.value("dirpath"))
+                settings.endArray()
+                
+                file_pane.current_dir_history = int(settings.value("current_history", 0))
+                file_dirs_panes.append((file_dir, file_pane))
+
+            settings.endArray()
+
+            i = int(settings.value("current_dirpath", 0))
+            tab.setCurrentIndex(i)
+
+            settings.endGroup()
+
+        settings.beginGroup("localsend")
+        count = settings.beginReadArray("devices")
+        for i in xrange(count):
+            settings.setArrayIndex(i)
+            device = settings.value("json")
+            device = json.loads(device)
+            g_localsend_devices.append(LocalsendDevice(**device))
+        settings.endArray()
+        myinfo = settings.value("myinfo", None)
+        if (myinfo is not None):
+            g_localsend_myinfo = json.loads(myinfo)
+        settings.endGroup()
+        
+        if ((len(self.left_panes) == 0) and (left_file_dir is None)):
+            left_file_dir = os.getcwd()
+
+        if ((len(self.right_panes) == 0) and (right_file_dir is None)):
+            right_file_dir = os.getcwd()
+
+        if (left_file_dir is not None):
+            tab = self.left_tab
+            file_pane = self.createPane(tab)
+            file_dirs_panes.append((left_file_dir, file_pane))
+            
+        if (right_file_dir is not None):
+            tab = self.right_tab
+            file_pane = self.createPane(tab)
+            file_dirs_panes.append((right_file_dir, file_pane))
+            
         central_widget = splitter
         self.setCentralWidget(central_widget)
 
@@ -7206,11 +7481,22 @@ class TwinWindow(QMainWindow):
         self.show()
 
         # Set the directories after showing the app so the FilePane loading
-        # directory dialog boxes show on top of the app window and not in
-        # isolation
-        file_dirs = [left_file_dir, right_file_dir]
-        for file_pane, file_dir in zip(self.file_panes, file_dirs):
-            file_pane.setDirectory(file_dir)
+        # directory dialog boxes show on top of the app window and not out of
+        # nowhere
+        for file_dir, file_pane in file_dirs_panes:
+            if (file_dir.startswith("search:")):
+                # XXX Set this in setSearchString
+                file_pane.search_mode = True
+                file_pane.old_file_dir = os.getcwd()
+                file_pane.setSearchString(file_dir[len("search:"):])
+
+            else:
+                file_pane.setDirectory(file_dir, False)
+
+        if (current_pane == "left"):
+            self.getLeftPane().getActiveView().setFocus()
+        else:
+            self.getRightPane().getActiveView().setFocus()
         
         logger.info("App font %s pointSize %d height %d", qApp.font().family(), qApp.font().pointSize(), qApp.fontMetrics().height())
 
@@ -7227,9 +7513,16 @@ class TwinWindow(QMainWindow):
         self.copySelectedFilesAct = QAction("Copy Files", self, shortcut="F5", triggered=self.copySelectedFiles, shortcutContext=Qt.ApplicationShortcut)
         self.moveSelectedFilesAct = QAction("Move Files", self, shortcut="F6", triggered=self.moveSelectedFiles, shortcutContext=Qt.ApplicationShortcut)
 
-        self.diffDirsAct = QAction("Diff directories", self, shortcut="ctrl+m", triggered=self.diffDirectories, shortcutContext=Qt.ApplicationShortcut)
+        self.diffDirsAct = QAction("Diff Directories", self, shortcut="ctrl+m", triggered=self.diffDirectories, shortcutContext=Qt.ApplicationShortcut)
+        self.diffExternallyAct = QAction("Diff with External Tool", self, shortcut="ctrl+shift+m", triggered=self.diffExternally, shortcutContext=Qt.ApplicationShortcut)
 
-        self.swapPaneContentsAct = QAction("Switch Panes", self, shortcut="ctrl+u", triggered=self.swapPaneContents, shortcutContext=Qt.ApplicationShortcut)
+        self.swapPanesAct = QAction("Switch Panes", self, shortcut="ctrl+u", triggered=self.swapPanes, shortcutContext=Qt.ApplicationShortcut)
+
+        self.chooseBookmarkAct = QAction('Choose Bookmark', self, shortcut="ctrl+d", triggered=self.chooseBookmark, shortcutContext=Qt.ApplicationShortcut)
+        
+        self.newTabAct = QAction("New Tab", self, shortcut="ctrl+t", triggered=self.chooseTab, shortcutContext=Qt.ApplicationShortcut)
+        self.closeTabAct = QAction("Close Tab", self, triggered=self.closeTab, shortcutContext=Qt.ApplicationShortcut)
+        self.closeTabAct.setShortcuts(["ctrl+w", "ctrl+shift+t"])
 
         self.profileAct = QAction("Profile", self, shortcut="ctrl+p", triggered=self.profile, shortcutContext=Qt.ApplicationShortcut)
 
@@ -7237,12 +7530,16 @@ class TwinWindow(QMainWindow):
         # XXX Allow filtering files by typing name
         
         self.addAction(self.nextPaneAct)
+        self.addAction(self.chooseBookmarkAct)
+        self.addAction(self.newTabAct)
+        self.addAction(self.closeTabAct)
         self.addAction(self.leftToRightAct)
         self.addAction(self.rightToLeftAct)
         self.addAction(self.copySelectedFilesAct)
         self.addAction(self.moveSelectedFilesAct)
         self.addAction(self.diffDirsAct)
-        self.addAction(self.swapPaneContentsAct)
+        self.addAction(self.diffExternallyAct)
+        self.addAction(self.swapPanesAct)
         self.addAction(self.profileAct)
 
     def leftToRight(self, reverse=False):
@@ -7353,27 +7650,45 @@ class TwinWindow(QMainWindow):
                 if (self.getTargetPane().model.watcher is None):
                     self.getTargetPane().reloadDirectory()
 
-    def swapPaneContents(self):
+    def swapPanes(self):
         logger.info("")
 
-        # XXX Needs to swap search_mode?
-        
-        # XXX Right now this only swaps the contents, should also swap the
-        #     panes preserving selection, history, etc?
-        left_view = self.getLeftPane().getActiveView()
-        right_view = self.getRightPane().getActiveView()
-        m_left = left_view.model()
-        m_right = right_view.model()
-        m_selection_left = left_view.selectionModel()
-        m_selection_right = right_view.selectionModel()
+        target_pane = self.getTargetPane()
 
-        self.getLeftPane().setModels(m_right, m_selection_right)
-        self.getRightPane().setModels(m_left, m_selection_left)
+        left_pane = self.getLeftPane()
+        right_pane = self.getRightPane()
+
+        i_left = self.left_panes.index(left_pane)
+        i_right = self.right_panes.index(right_pane)
+
+        # Remove first to remove ownership, otherwise an owned pane cannot be
+        # set on a different tab
+        self.left_tab.removeTab(i_left)
+        self.right_tab.removeTab(i_right)
+        
+        self.left_panes[i_left] = right_pane
+        self.left_tab.insertTab(i_left, right_pane, "")
+        self.left_tab.setCurrentIndex(i_left)
+        right_pane.updateDirectoryLabel()
+
+        self.right_panes[i_right] = left_pane
+        self.right_tab.insertTab(i_right, left_pane, "")
+        self.right_tab.setCurrentIndex(i_right)
+        left_pane.updateDirectoryLabel()
+
+        target_pane.getActiveView().setFocus()
 
     def diffDirectories(self):
+        """
+        Mark newer or different files and directories, ignore same files (same
+        name and size)
+        """
         logger.info("Start")
         # Sort both directories, mark newer or unique files
-        
+
+        # XXX Do in background, at the very least show message box and allow
+        #     cancel
+
         # Selecting files can be slow when signals are fired individually,
         # create a selection and select that one
         
@@ -7381,107 +7696,404 @@ class TwinWindow(QMainWindow):
         r_right = 0
         m_left = self.getLeftPane().getActiveView().model()
         m_right = self.getRightPane().getActiveView().model()
-        i_left = m_left.index(r_left,0)
-        i_right = m_right.index(r_right,0)
-
-        # Skip directories
-        # XXX Use the right flag once fileinfos are integrated
-        size_col = 3
-        while (i_left.isValid() and (i_left.sibling(r_left, size_col).data(Qt.DisplayRole) == "<DIR>")):
-            logger.info("Skipping dir %r", i_left.data(Qt.DisplayRole))
-            r_left += 1
-            i_left = m_left.index(r_left, 0)
-
-        while (i_right.isValid() and (i_right.sibling(r_right, size_col).data(Qt.DisplayRole) == "<DIR>")):
-            logger.info("Skipping dir %r", i_right.data(Qt.DisplayRole))
-            r_right += 1
-            i_right = m_right.index(r_right, 0)
-
+        
         s_left = QItemSelection()
         s_right = QItemSelection()
+        qApp.setOverrideCursor(Qt.WaitCursor)
         while (True):
-
             i_left = m_left.index(r_left, 0)
             i_right = m_right.index(r_right, 0)
 
-            if (not(i_left.isValid() or i_right.isValid())):
+            if ((not i_left.isValid()) or (not i_right.isValid())):
                 break
 
-            # This assumes the models are similarly sorted
-            c = 1 if (not i_left.isValid()) else (-1 if (not i_right.isValid()) else cmp(i_left.data(Qt.UserRole).filename, i_right.data(Qt.UserRole).filename))
+            f_left = i_left.data(Qt.UserRole)
+            f_right = i_right.data(Qt.UserRole)
+
+            # This assumes the models are sorted via fileinfo_cmp
+            c = fileinfo_cmp(f_left, f_right)
+            assert None is logger.debug("Compared %d %r vs. %r", c,f_left.filename, f_right.filename)
 
             if (c == 0):
-                assert None is logger.debug("Matching files %r vs. %r", i_left.data(Qt.DisplayRole), i_right.data(Qt.DisplayRole))
-                # Advance both, add newest
-                # display dates are lexycographically comparable
-                # XXX Compare the right thing once all the fileinfo data is
-                #     integrated
-                date_col = 4
-                # Note reversed comparison so newer files are selected
-                c = cmp(i_right.sibling(r_right, date_col).data(Qt.DisplayRole), i_left.sibling(r_left, date_col).data(Qt.DisplayRole))
+                assert None is logger.debug("Equal filenames %r vs. %r", f_left.filename, f_right.filename)
+                
+                assert None is logger.debug("Comparing sizes %d vs. %d", f_left.size, f_right.size)
+                # Assume same if same size
+                if (f_left.size != f_right.size):
+                    # Advance both, add newest
+                    # Note reversed comparison so newer files are selected
+                    c = cmp(f_right.mtime, f_left.mtime)
 
-                # Undo the advance done below
-                r_left += 0 if (c == -1) else 1
-                r_right += 0 if (c == 1) else 1
+                    assert None is logger.debug("Compared times %d %r vs. %r", c, f_left.mtime, f_right.mtime)
 
-                # Fall-through
+                if (c == 0):
+                    r_left += 1
+                    r_right += 1
 
-            if (c == -1):
-                assert None is logger.debug("Selecting left file %r", i_left.data(Qt.DisplayRole))
+                # Fall-through for -1 and 1 cases
+
+            if (c < 0):
+                assert None is logger.debug("Selecting left file %r", f_left.filename)
                 # Add left, advance left
                 s_left.select(i_left, i_left)
                 r_left += 1
 
-            elif (c == 1):
-                assert None is logger.debug("Selecting right file %r", i_right.data(Qt.DisplayRole))
+            elif (c > 0):
+                assert None is logger.debug("Selecting right file %r", f_right.filename)
                 # Add right, advance right
                 s_right.select(i_right, i_right)
                 r_right += 1
 
+        # Complete the selection with the remaining items if any
+        if (i_left.isValid()):
+            i_end = m_left.index(m_left.rowCount()-1, 0)
+            s_left.select(i_left, i_end)
+
+        elif (i_right.isValid()):
+            i_end = m_right.index(m_right.rowCount()-1, 0)
+            s_right.select(i_right, i_end)
+
         self.getLeftPane().getActiveView().selectionModel().select(s_left, QItemSelectionModel.Select | QItemSelectionModel.Rows)
         self.getRightPane().getActiveView().selectionModel().select(s_right, QItemSelectionModel.Select | QItemSelectionModel.Rows)
 
+        qApp.restoreOverrideCursor()
         logger.info("Done")
-        
+
+    def diffExternally(self):
+        """
+        Diff with external tool either:
+        - The two selected entries (in source, in target, or across panes)
+        - The two pane directories if no selection
+        """
+        logger.info("")
+
+        # XXX Make this work with archives
+        if (
+            (not self.getSourcePane().checkOperation("Diff Externally")) or
+            (not self.getTargetPane().checkOperation("Diff Externally"))):
+            return
+
+        src_filepaths = self.getSourcePane().getSelectedFilepaths(True)
+        dst_filepaths = self.getTargetPane().getSelectedFilepaths(True)
+
+        if ((len(src_filepaths) == 0) and (len(dst_filepaths) == 0)):
+            # No selection, diff dirs
+            # XXX What about search strings?
+            src_filepath = self.getSourcePane().file_dir
+            dst_filepath = self.getTargetPane().file_dir
+
+        elif ((len(src_filepaths) == 1) and (len(dst_filepaths) == 1)):
+            # Single selection, diff entries
+            src_filepath = src_filepaths[0]
+            dst_filepath = dst_filepaths[0]
+
+        elif (len(src_filepaths) == 2):
+            # Two selections on src, prioritize src over dst
+            src_filepath = src_filepaths[0]
+            dst_filepath = src_filepaths[1]
+
+        elif (len(src_filepaths) == 2):
+            # Two selections on dst
+            src_filepath = dst_filepaths[0]
+            dst_filepath = dst_filepaths[1]
+
+        else:
+            # Other combinations are invalid, ignore
+            
+            # XXX Could pass selected source and target files to kdiff3, does
+            #     kdiff3 accept list of files?
+            return
+
+        arguments = [src_filepath, dst_filepath]
+        # Start detached will create an independent process instead of a child
+        QProcess().startDetached(g_external_diff_filepath, arguments)
+
     def getLeftPane(self):
-        return self.file_panes[0]
+        return self.left_panes[self.left_tab.currentIndex()]
     
     def getRightPane(self):
-        return self.file_panes[1]
+        return self.right_panes[self.right_tab.currentIndex()]
 
     def getSourcePane(self):
-        if (self.focusWidget() is self.file_panes[0].getActiveView()):
-            return self.file_panes[0]
+        if (self.focusWidget() is self.getLeftPane().getActiveView()):
+            return self.getLeftPane()
         else:
-            return self.file_panes[1]
+            return self.getRightPane()
 
     def getTargetPane(self):
-        if (self.focusWidget() is self.file_panes[0].getActiveView()):
-            return self.file_panes[1]
+        if (self.getSourcePane() is self.getRightPane()):
+            return self.getLeftPane()
         else:
-            return self.file_panes[0]
+            return self.getRightPane()
 
     def getActivePane(self):
-        if (self.focusWidget() is self.file_panes[0].getActiveView()):
-            return self.file_panes[0]
-        else:
-            return self.file_panes[1]
-
+        return self.getSourcePane()
+            
     def nextPane(self):
         logger.info("")
-        if (self.focusWidget() is self.file_panes[0].getActiveView()):
-            self.file_panes[1].getActiveView().setFocus()
-        else:
-            self.file_panes[0].getActiveView().setFocus()
+        self.getTargetPane().getActiveView().setFocus()
         
         # updateWindowTitle is called in eventFilter when focusIn is detected on
         # the pane, no need to explicitly call here
+
+    def createPane(self, tab, display_width=DISPLAY_WIDTH):
+        logger.info("")
+
+        def updateTabTitle(tab, file_pane, text):
+            logger.info("%r, %r, %r", tab, file_pane, text)
+            if (text.startswith("search:")):
+                text = "s:" + text[len("search:"):]
+
+            else:
+                basename = os.path.basename(text)
+                # basename is not useful for roots (shares, drives), in that case
+                # show the incoming text
+                text = basename if (basename != "") else (text if (text != "") else os.sep)
+            
+            index = tab.indexOf(file_pane)
+            tab.setTabText(index, text)
+            # Use full directory as tooltip
+            if (not file_pane.search_mode):
+                text = file_pane.file_dir
+            tab.setTabToolTip(index, text)
+
+        file_pane = FilePane(display_width)
+        
+        if (tab is self.left_tab):
+            self.left_panes.append(file_pane)
+        else:
+            self.right_panes.append(file_pane)
+
+        # Tab title will be set when calling setDirectory
+        tab.addTab(file_pane, "")
+
+        # Use the runtime parent instead of the current value of "tab" since
+        # FilePanel can be reparented at runtime when swapPanes is used. Note
+        # the hierarchy is FilePane->QStackWidget-> QTabWidget
+        file_pane.directoryLabelChanged.connect(lambda a: updateTabTitle(file_pane.parent().parent(), file_pane, a))
+
+        return file_pane
+
+    def chooseTab(self):
+        """
+        Show popup of tabs, allow creating, deleting or switching to a tab
+        """
+        logger.info("")
+        
+        active_pane = self.getActivePane()
+        tab = self.left_tab if (active_pane is self.getLeftPane()) else self.right_tab
+        
+        menu = EditablePopupMenu(self, allow_check=False, allow_delete=True)
+        action = menu.addAction("New tab")
+        action.setData(tab.count())
+        menu.addSeparator()
+        for i in xrange(tab.count()):
+            file_pane = tab.widget(i)
+
+            tab_title = ("search:%s" % file_pane.search_string) if file_pane.search_mode else file_pane.file_dir
+            action = menu.addAction(tab_title, i, True)
+            # Needs checkable before checked, otherwise checked is ignored
+            action.setCheckable(i == tab.currentIndex())
+            action.setChecked(i == tab.currentIndex())
+
+        action = menu.exec_(tab.tabBar().mapToGlobal(tab.tabBar().rect().bottomLeft()))
+        tab_index_set = set([a.data() for a in menu.actions() if a.data() is not None])
+
+        if (action is not None):
+            # XXX Make it so it opens the tab on the other pane if shift is pressed?
+            if ((action.data() == tab.count()) or (QApplication.keyboardModifiers() & Qt.ControlModifier)):
+                # Create a new tab
+                logger.info("Creating and activating tab %d", action.data())
+                if (action.data() < tab.count()):
+                    # Ctrl was pressed on a valid entry, duplicate that entry
+                    active_pane = tab.widget(action.data())
+
+                # XXX Insert after the current one?
+                file_pane = self.createPane(tab, active_pane.display_width)
+                
+                if (active_pane.search_mode):
+                    file_pane.search_mode = True
+                    file_pane.old_file_dir = active_pane.old_file_dir
+                    file_pane.setSearchString(active_pane.search_string)
+
+                else:
+                    file_pane.setDirectory(active_pane.file_dir)
+
+                if (active_pane.getActiveView() is active_pane.list_view):
+                    file_pane.switchView()
+
+                tab.setCurrentWidget(file_pane)
+            
+            else:
+                logger.info("Activating tab %d", action.data())
+                # Activate into a new tab if ctrl is pressed
+                tab.setCurrentIndex(action.data())
+        
+        # Close deleted tabs, last first to preserve index validity
+        for tab_index in sorted(menu.deleted_datas, reverse=True):
+            logger.info("Removing tab %d", tab_index)
+            self.removeTab(tab, tab_index)
+
+    def removeTab(self, tab, index):
+        logger.info("index %d", index)
+
+        file_panes = self.left_panes if (tab is self.left_tab) else self.right_panes
+        
+        if (len(file_panes) == 1):
+            logger.info("Not deleting last pane")
+            return
+
+        must_refocus = (self.getActivePane() is file_panes[index])
+        tab.removeTab(index)
+        del file_panes[index]
+
+        if (must_refocus):
+            i = tab.currentIndex()
+            file_panes[i].getActiveView().setFocus()
+
+    def closeTab(self):
+        logger.info("")
+        active_pane = self.getActivePane()
+
+        tab = self.left_tab if (active_pane is self.getLeftPane()) else self.right_tab
+        file_panes = self.left_panes if (tab is self.left_tab) else self.right_panes
+
+        i = file_panes.index(active_pane)
+        self.removeTab(tab, i)
+
+    def chooseBookmark(self):
+        """
+        Show a popup of bookmarks, allow creating, deleting or switching to a
+        bookmark.
+
+        This needs to be handled at the app level rather than at FilePane
+        because the bookmark can open in a new tab with ctrl+enter.
+
+        In addition, bookmarks are application-global, handling them here
+        simplifies things (although the bookmark reference could be shared
+        across FilePanes).
+        """
+        logger.info("")
+
+        active_pane = self.getActivePane()
+        tab = self.left_tab if (active_pane is self.getLeftPane()) else self.right_tab
+
+        menu = EditablePopupMenu(self, allow_check=False, allow_delete=True)
+        for i, bookmark in enumerate(self.bookmarks):
+            action = menu.addAction(bookmark, bookmark, True)
+        menu.addSeparator()
+        addCurrentAct = menu.addAction("Add current")
+        
+        action = menu.exec_(active_pane.directory_label.mapToGlobal(active_pane.directory_label.rect().bottomLeft()))
+        
+        # Remove the the deleted bookmarks, don't change the ordering
+        for bookmark in menu.deleted_datas:
+            self.bookmarks.remove(bookmark)
+        
+        if (action is addCurrentAct):
+            if (active_pane.search_mode):
+                bookmark = "search:" + active_pane.search_string
+            else:
+                bookmark = active_pane.file_dir
+            
+            # Ignore duplicates
+            if (bookmark not in self.bookmarks):
+                logger.info("Adding current bookmark %r", bookmark)
+                self.bookmarks.append(bookmark)
+                # XXX Is there value in preserving the creation order which
+                #     translates into a predictible shortcut?
+                # XXX Allow a human friendly name?
+                self.bookmarks = sorted(self.bookmarks)
+        
+        elif (action is not None):
+            logger.info("Switching to bookmark %r", action.data())
+            # Switch the other opane if shift is pressed
+            if (QApplication.keyboardModifiers() & Qt.ShiftModifier):
+                tab = self.left_tab if (active_pane is self.getRightPane()) else self.right_tab
+                active_pane = self.getTargetPane()
+                
+            # Switch to that bookmark, in a new tab if ctrl is pressed
+            if (QApplication.keyboardModifiers() & Qt.ControlModifier):
+                # XXX Insert after the current one?
+                active_pane = self.createPane(tab)
+                tab.setCurrentWidget(active_pane)
+                
+            bookmark = action.data()
+            if (bookmark.startswith("search:")):
+                active_pane.search_mode = True
+                active_pane.setSearchString(bookmark[len("search:"):])
+
+            else:
+                active_pane.setDirectory(bookmark)
+
 
     def closeEvent(self, event):
         logger.info("closeEvent")
         # XXX Ignore cleanup at closeEvent time since it blocks unnecessarily
         #     at exit time when there are pending prefetches
         # self.cleanup()
+
+        # Collect current state into settings
+        
+        # XXX Do this in the places where the settings change? Per docs,
+        #     QSettings already saves periodically
+        settings = self.settings
+        # XXX All entries are written here for the time being, delete all.
+        #     Remove once entries are saved periodically
+        settings.remove("")
+        # Root items on ini files will go in the "General" group, trying to use
+        # "general" as a group will be escaped into "#general". Just use the
+        # root group for simplicity
+        settings.setValue("file_version", CONFIG_FILE_VERSION)
+        settings.setValue("app_version", APPLICATION_VERSION)
+        settings.setValue("current_pane", "left" if (self.getActivePane() is self.getLeftPane()) else "right")
+        # XXX Store main window geometry (position, size, monitor?), one entry
+        #     per screen resolution?
+        settings.setValue("window_geometry", self.geometry())
+        settings.setValue("external_viewer_filepath", g_external_viewer_filepath)
+        settings.setValue("external_diff_filepath", g_external_diff_filepath)
+        # XXX Store plugin info (and edit by hand for now?)
+        for file_panes in (self.left_panes, self.right_panes):
+            group_name = "left" if (file_panes is self.left_panes) else "right"
+            tab = self.left_tab if (group_name == "left") else self.right_tab
+            settings.beginGroup(group_name)
+            settings.setValue("current_tab", tab.currentIndex())
+            settings.beginWriteArray("tabs")
+            for i, file_pane in enumerate(file_panes):
+                settings.setArrayIndex(i)
+                file_dir = ("search:%s" % file_pane.file_dir) if file_pane.search_mode else file_pane.file_dir
+                settings.setValue("dirpath", file_dir)
+                settings.setValue("mode", "thumbnails" if (file_pane.getActiveView() is file_pane.list_view) else "files")
+                settings.setValue("display_width", file_pane.display_width)
+                
+                settings.beginWriteArray("history")
+                for j, dirpath in enumerate(file_pane.dir_history):
+                    settings.setArrayIndex(j)
+                    settings.setValue("dirpath", dirpath)
+                settings.endArray()
+                settings.setValue("current_history", file_pane.current_dir_history)
+                
+            settings.endArray()
+            settings.endGroup()
+
+        settings.beginWriteArray("bookmarks")
+        for i, bookmark in enumerate(self.bookmarks):
+            settings.setArrayIndex(i)
+            settings.setValue("dirpath", bookmark)
+        settings.endArray()
+
+        settings.beginGroup("localsend")
+        settings.beginWriteArray("devices")
+        for i, device in enumerate(g_localsend_devices):
+            settings.setArrayIndex(i)
+            # device is a named tuple, which jsonifies as a list, convert to
+            # dict first
+            settings.setValue("json", json.dumps(device._asdict()))
+        settings.endArray()
+        # XXX myinfo is already a dict, convert to localsenddevice for
+        #     consistency or viceversa?
+        settings.setValue("myinfo", json.dumps(g_localsend_myinfo))
+        settings.endGroup()
 
         return super(TwinWindow, self).closeEvent(event)
 
@@ -7517,6 +8129,7 @@ logger = logging.getLogger(__name__)
 setup_logger(logger)
 logger.setLevel(logging.WARNING)
 logger.setLevel(logging.INFO)
+#logger.setLevel(logging.DEBUG)
 
 
 if (do_parse_test):
@@ -7527,27 +8140,24 @@ def main():
     restore_python_exceptions()
 
     app = QApplication(sys.argv)
-    
-    default_file_dir = R"C:\Users\Public\Pictures"
-    file_dirs = [default_file_dir, default_file_dir]
 
+    file_dirs = [None, None]
     if (len(sys.argv) > 1):
         file_dirs[0] = sys.argv[1]
         file_dirs[1] = sys.argv[min(2, len(sys.argv)-1)]
-
-    for i, file_dir in enumerate(file_dirs):
-        # These could be relative, abspath so they can be traversed up (in
-        # addition that makes it appear properly and resolve the disk total and
-        # free sizes in the directory label), but don't abspath network root
-        # since it breaks    
-        if (not(os_path_contains(SHARE_ROOT, file_dir))):
-            file_dir = os.path.abspath(file_dir)
-            # If it doesn't exist, ask for a directory
-            if (not os.path.exists(file_dir)):
-                file_dir = qGetExistingDirectory(None, "Select Folder", os.getcwd())
-                if (file_dir == ""):
-                    file_dir = default_file_dir
-            file_dirs[i] = file_dir
+        for i, file_dir in enumerate(file_dirs):
+            # These could be relative, abspath so they can be traversed up (in
+            # addition that makes it appear properly and resolve the disk total
+            # and free sizes in the directory label), but don't abspath network
+            # root since it breaks    
+            if (not(os_path_contains(SHARE_ROOT, file_dir))):
+                # If it doesn't exist, ask for a directory
+                if (not os.path.exists(file_dir)):
+                    file_dir = qGetExistingDirectory(None, "Select Folder", os.getcwd())
+                    if (file_dir == ""):
+                        file_dir = os.getcwd()
+                file_dir = os.path.abspath(file_dir)
+                file_dirs[i] = file_dir
 
     window = TwinWindow(file_dirs[0], file_dirs[1])
     window.show()

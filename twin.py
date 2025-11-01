@@ -221,35 +221,55 @@ def fileinfo_build_attr(is_dir, is_hidden, is_writable, is_link):
         0
     )
 
-def sort_fileinfos(dir_infos_set, file_infos):
-    # Sort ".." first, then other directories alphabetically, then files
-    # alphabetically
-    return (sorted(dir_infos_set, key=lambda a: chr(0) if (a.filename == "..") else a.filename.lower()) + 
-            sorted(file_infos, key= lambda a: a.filename.lower()))
-
-def fileinfo_cmp(a, b):
+def fileinfo_cmp(a, b, field=0, reverse=False):
     """
-    Compare FileInfos by name: ".." first, then directories sorted
-    alphabetically, then files sorted alphabetically
+    Compare FileInfos by the given field, name by default: ".." first, then
+    directories sorted alphabetically, then files sorted alphabetically
     """
     a_is_dir = fileinfo_is_dir(a) 
     b_is_dir = fileinfo_is_dir(b) 
+
+    assert field < len(a), "wrong field index %d" % field
 
     if (a == ".."):
         if (b == ".."):
             res = 0
         else:
             res = -1
+    
     elif (b == ".."):
         res = 1
+
     elif (a_is_dir == b_is_dir):
-        res = cmp(a.filename.lower(), b.filename.lower())
+        # Always compare dirs by name
+        if ((field == 0) or a_is_dir):
+            res = cmp(a.filename.lower(), b.filename.lower())
+        else:
+            res = cmp(a[field], b[field])
+
+        # Don't reverse directory ordering, only files
+        res = -res if (reverse and not a_is_dir) else res
+
     elif (a_is_dir):
         res = -1
+        
     else:
+        assert b_is_dir
         res = 1
         
     return res
+
+def sort_fileinfos(file_infos, sort_field, sort_order):
+    """
+    Sort in place
+    """
+    logger.info("Sorting %d file_infos sort_field %d sort_order %d", len(file_infos), sort_field, sort_order)
+    file_infos.sort(
+        cmp=lambda a, b: fileinfo_cmp(a, b, sort_field, sort_order == Qt.DescendingOrder),
+    )
+
+    logger.info("Sorted")
+
 
 def class_name(o):
     return o.__class__.__name__
@@ -1668,9 +1688,20 @@ def localsend_upload_to_device(myinfo, device, filepath):
 
     return result
 
-# major.minor.patch
-APPLICATION_VERSION = "0.0.1"
-CONFIG_FILE_VERSION = "0.0.1"
+# MAJOR.MINOR.PATCH
+# MAJOR version when you make incompatible API changes,
+# MINOR version when you add functionality in a backwards compatible manner, and
+# PATCH version when you make backwards compatible bug fixes.
+# 0.0.1
+# - Config file, tabs, bookmarks, external diff, 
+# - fixes to localsend, dir comparision, ScaledIconDelegate
+# 0.1.0 
+# - Sorted columns, loading indicator, choosetab on right click
+# - Fixes to current_tab settings, headerChooser crash, stale image crash
+APPLICATION_VERSION = "0.1.0"
+# 0.0.1 Added config file
+# 0.1.0 Added sorting settings
+CONFIG_FILE_VERSION = "0.1.0"
 
 INCLUDE_DIR = "include"
 TEMP_DIR = os.path.join("_out", "temp")
@@ -1750,10 +1781,6 @@ use_delegate = True
 # scrollbars change scale as new rows are loaded...
 use_incremental_row_loading = False
 
-# XXX There's some cleanup pending regarding whether to purge stale image
-#     requests
-use_everything = False
-
 # Set to force all listings to be single thread, this simplifies debugging
 force_single_thread = False
 
@@ -1776,8 +1803,10 @@ force_everything_single_thread = True
 #
 # XXX In the future have a thread per WFX or for all WFX if necessary? 
 #
-# XXX This is also the case for WCX?
 force_wfx_single_thread = True
+
+# XXX Is the above also the case for WCX?
+force_wcx_single_thread = True
 
 # Run ctypes parsing tests
 do_parse_test = False
@@ -2161,9 +2190,10 @@ class EverythingFileInfoIterator(FileInfoIterator):
     Another option is to use the command line interface
     """
     c = None
-    def __init__(self, query, first_result = 0, max_results=50000, hwnd = None, *args, **kwargs):
+    def __init__(self, query, first_result = 0, max_results=50000, hwnd = None, sort_field = 2, sort_reverse=False, *args, **kwargs):
         # XXX Missing search order, is_regexp, etc
-        logger.info("query %s first %d max %d hwnd %s", query, first_result, max_results, hwnd)
+        logger.info("query %s first %d max %d hwnd %s sort_field %d sort_reverse=%s", 
+            query, first_result, max_results, hwnd, sort_field, sort_reverse)
         
         self.query = query
         self.num_results = None
@@ -2172,6 +2202,8 @@ class EverythingFileInfoIterator(FileInfoIterator):
         self.max_results = max_results
         self.done = False
         self.offset = 0
+        self.sort_field = sort_field
+        self.sort_reverse = sort_reverse
         
         # On XP 32-bit there's a warning when WinDLL cannot load a DLL, don't
         # load 64 bit and fallback to 32, check 32 bit explicitly
@@ -2226,7 +2258,28 @@ class EverythingFileInfoIterator(FileInfoIterator):
         c.Everything_SetMatchPath(True)
         c.Everything_SetMatchCase(False)
         c.Everything_SetRequestFlags(c.EVERYTHING_REQUEST_FILE_NAME | c.EVERYTHING_REQUEST_PATH | c.EVERYTHING_REQUEST_SIZE | c.EVERYTHING_REQUEST_DATE_MODIFIED | c.EVERYTHING_REQUEST_ATTRIBUTES)
-        c.Everything_SetSort(c.EVERYTHING_SORT_DATE_MODIFIED_DESCENDING)
+        # FileInfo: Filename, size, mtime, attr
+        # Model: Full filename, Filename, ext, size, date, attr
+        everything_sort = 0
+        if (self.sort_field == 0):
+            everything_sort = c.EVERYTHING_SORT_NAME_ASCENDING
+
+        elif (self.sort_field == 1):
+            everything_sort = c.EVERYTHING_SORT_SIZE_ASCENDING
+
+        elif (self.sort_field == 2):
+            everything_sort = c.EVERYTHING_SORT_DATE_MODIFIED_ASCENDING
+
+        elif (self.sort_field == 3):
+            everything_sort = c.EVERYTHING_SORT_ATTRIBUTES_ASCENDING
+
+        else:
+            assert False, "Unknown sort field %d" % self.sort_field
+        if (self.sort_reverse):
+            everything_sort += 1
+
+        logger.info("Setting everything sort %d", everything_sort)
+        c.Everything_SetSort(everything_sort)
 
         # XXX Direct WM_COPYDATA not supported yet
         if (hwnd is not None):
@@ -2454,10 +2507,7 @@ class Win32FileInfoIterator(FileInfoIterator):
         # This is modified when recursing, save
         self.current_dirpath = dirpath
 
-        # XXX No point in sorting if there's a batch_size since the next batch
-        #     will be not sorted wrt this one?
-        assert None is logger.debug("Sorting %d + %d", len(file_infos), len(dir_infos_set))
-        file_infos = sort_fileinfos(dir_infos_set, file_infos)
+        file_infos = list(dir_infos_set) + file_infos 
 
         self.done = (len(file_infos) == 0)
 
@@ -2788,7 +2838,7 @@ class WFXFileInfoIterator(FileInfoIterator):
             if ((batch_size > 0) and ((len(file_infos) + len(dir_infos_set)) > batch_size)):
                 break
         
-        file_infos = sort_fileinfos(dir_infos_set, file_infos)
+        file_infos = list(dir_infos_set) + file_infos 
 
         # Update the resume values in case any was modified in the loop (no need
         # to update dirpath_stack since it's a reference to self.dirpath_stack)
@@ -3028,8 +3078,7 @@ class WCXFileInfoIterator(FileInfoIterator):
                 if ((batch_size > 0) and (len(file_infos) + len(dir_infos_set)) > batch_size):
                     break
 
-        logger.info("Sorting")
-        file_infos = sort_fileinfos(dir_infos_set, file_infos)
+        file_infos = list(dir_infos_set) + file_infos 
 
         self.done = (self.done or (len(file_infos) == 0))
 
@@ -3221,8 +3270,7 @@ class QtFileInfoIterator(FileInfoIterator):
             if ((not it.hasNext()) or ((batch_size > 0) and (len(file_infos) + len(dir_infos_set)) > batch_size)):
                 break
 
-        logger.info("Sorting")
-        file_infos = sort_fileinfos(dir_infos_set, file_infos)
+        file_infos = list(dir_infos_set) + file_infos 
         self.done = (len(file_infos) == 0)
                
         return dir_infos_set, file_infos
@@ -3293,7 +3341,8 @@ class ListdirFileInfoIterator(FileInfoIterator):
 
             if (((batch_size > 0) and ((len(dir_infos_set) + len(file_infos)) >= batch_size)) or (len(l) == 0)):
                 break
-        file_infos = sort_fileinfos(dir_infos_set,file_infos)
+
+        file_infos = list(dir_infos_set) + file_infos 
         
         return dir_infos_set, file_infos
 
@@ -3438,7 +3487,7 @@ class ZipFileInfoIterator(FileInfoIterator):
             if (((batch_size > 0) and ((len(dir_infos_set) + len(file_infos)) >= batch_size)) or (len(l) == 0)):
                 break
 
-        file_infos = sort_fileinfos(dir_infos_set, file_infos)
+        file_infos = list(dir_infos_set) + file_infos 
         
         self.done = (len(file_infos) == 0)
         
@@ -3576,7 +3625,7 @@ class CsvFileInfoIterator(FileInfoIterator):
                 time.sleep(1)
                 break
 
-        file_infos = sort_fileinfos(dir_infos_set, file_infos)
+        file_infos = list(dir_infos_set) + file_infos 
         self.done = (len(file_infos) == 0)
             
         return dir_infos_set, file_infos
@@ -3942,6 +3991,13 @@ class DirectoryModel(QAbstractTableModel):
         self.loaded_rows = 0
         self.file_infos = []
         self.dir_infos_set = set()
+        self.is_search_string = False
+
+        # XXX These are actually stored on the headerview, remove if using
+        #     proxymodel?
+        self.sort_order = None
+        self.sort_field = None
+        self.sort_column = None
 
         self.it = None
 
@@ -3960,7 +4016,12 @@ class DirectoryModel(QAbstractTableModel):
             """
             logger.info("row_hint %d %r", row_hint, filepath)
 
-            index = self.createIndex(row_hint, 0)
+            # This could be out of bounds if a stale request gets here, assign
+            # an invalid index explicitly if so (isValid()
+            # doesn't check for bounds, Qt 5.11 introduces checkIndex for that).
+            # See
+            # https://stackoverflow.com/questions/20530638/should-qabstractitemmodelindexrow-column-parent-check-for-invalid-inputs
+            index = self.createIndex(row_hint, 0) if (row_hint < self.rowCount()) else QModelIndex()
 
             # The index may no longer contain that filepath because the
             # directory was navigated away or some other index deleted, find the
@@ -3969,7 +4030,7 @@ class DirectoryModel(QAbstractTableModel):
                 # Find the new new row, if any, don't bother finding in the
                 # normal case where the directory was navigated away
                 if (self.is_search_string or (self.file_dir == os.path.basename(filepath))):
-                    row = self.model.findFileInfoRow(filepath) 
+                    row = self.findFileInfoRow(filepath) 
                     index = self.createIndex(row, 0) if (row != -1) else QModelIndex()
 
             if (index.isValid()):
@@ -4075,7 +4136,7 @@ class DirectoryModel(QAbstractTableModel):
         ]
             
         if (is_search_string):
-            it = EverythingFileInfoIterator(file_dir)
+            it = EverythingFileInfoIterator(file_dir, sort_field=self.sort_field, sort_reverse=(self.sort_order == Qt.DescendingOrder))
             loop = False
 
         elif (os_path_contains(SHARE_ROOT, file_dir)):
@@ -4154,6 +4215,14 @@ class DirectoryModel(QAbstractTableModel):
         logger.info("reading dir")
 
         def receive_direntry(dir_infos_set, file_infos):
+            
+            # Sorting is redundant for is_search_string and also lumps
+            # directories on top which doesn't honor Everything's sorting (eg
+            # more directories could be coming as rows are loaded if sorting by
+            # name)
+            if (not self.is_search_string):
+                sort_fileinfos(file_infos, self.sort_field, self.sort_order)
+
             self.mergeDirEntries(dir_infos_set, file_infos, insert_only)
             # New files received, there are begin and delete emits that will
             # update the view if they are visible, but if loaded_rows is not the
@@ -4194,6 +4263,7 @@ class DirectoryModel(QAbstractTableModel):
         self.directoryReader.direntryRead.connect(receive_direntry)
         single_thread = (force_single_thread or 
             (force_wfx_single_thread and isinstance(self.it, WFXFileInfoIterator)) or
+            (force_wcx_single_thread and isinstance(self.it, WCXFileInfoIterator)) or
             (force_everything_single_thread and isinstance(self.it, EverythingFileInfoIterator))
         )
         self.directoryReader.start(single_thread)
@@ -4413,7 +4483,7 @@ class DirectoryModel(QAbstractTableModel):
         if (clear_cache):
             self.clearCache()
             # Clearing the caches is not enough to refresh the visible items,
-            # since Qt may have its own DecorationRole cache
+            # since Qt may have its own DecorationRole cache, emit a dataChanged
             topleft = self.createIndex(0, 0)
             bottomright = self.createIndex(self.rowCount(), self.columnCount())
             self.dataChanged.emit(topleft, bottomright, [Qt.DecorationRole])
@@ -4429,6 +4499,10 @@ class DirectoryModel(QAbstractTableModel):
         - otherwise new_ is a complete list and make so the existing fileinfos
           ends up matching, but done in a way that sends incremental updates to
           the view
+
+        Does two things:
+        - Merge entries preserving UI (selection, currentindex)
+        - Merges entries preserving sort order
         """
         # XXX Test if blocksignals help with speed
         # self.blockSignals(True)
@@ -4450,8 +4524,17 @@ class DirectoryModel(QAbstractTableModel):
 
             assert None is logger.debug("Comparing old %r vs. new %r", f_old, f_new)
 
-            # Pick new if old is none, old if new is none, compare if both are not none
-            c = 1 if (f_old is None) else (-1 if (f_new is None) else fileinfo_cmp(f_old, f_new))
+            if (self.is_search_string):
+                # Everything search entries come presorted, doing sort on top of
+                # that would break since the Everything sort is different from
+                # the standard sort (eg no directory lumping at the beginning),
+                # but still want to do dummy row inserting etc, so just fudge c
+                # so it concatenates new entries at the end of old entries
+                c = 1 if (f_old is None) else -1
+
+            else:
+                # Pick new if old is none, old if new is none, compare if both are not none
+                c = 1 if (f_old is None) else (-1 if (f_new is None) else fileinfo_cmp(f_old, f_new, self.sort_field, self.sort_order == Qt.DescendingOrder))
 
             if (c == 0):
                 # Matching fileinfos, no need to insert
@@ -4761,16 +4844,16 @@ class DirectoryModel(QAbstractTableModel):
                 return Qt.AlignRight
             
 
-        if (role == Qt.EditRole):
+        elif (role == Qt.EditRole):
             return file_info.filename
 
-        if (role == Qt.ToolTipRole):
+        elif (role == Qt.ToolTipRole):
             # XXX Display the filepath of the current file in some label too?
             #     Useful for different long filepaths like search or everything
             #     results
             return os.path.join(self.file_dir, file_info.filename)
 
-        if (role == Qt.DisplayRole):            
+        elif (role == Qt.DisplayRole):            
             # XXX Should this take the basename at least for index 0 (listview)
             #     in case the filename is a deep relative path or absolute
             #     because of coming from Everyting or some search? But elision
@@ -4867,19 +4950,19 @@ class DirectoryModel(QAbstractTableModel):
                 # use pixmaps, which are opaque. Don't bother using thumbnails
                 # since they are too small
                 if (is_dir):
-                    if (file_name == ".."):
+                    if (file_info.size == -2):
+                        # Size being calculated
+                        return self.image_cache[":directory_sizing_icon"]
+
+                    elif (file_name == ".."):
                         return self.image_cache[":directory_up_icon"]
-                        
+
+                    elif (fileinfo_is_link(file_info)):
+                        return self.image_cache[":directory_link_icon"]
+
                     else:
-                        if (file_info.size == -2):
-                            # Size being calculated
-                            return self.image_cache[":directory_sizing_icon"]
+                        return self.image_cache[":directory_icon"]
 
-                        elif (fileinfo_is_link(file_info)):
-                            return self.image_cache[":directory_link_icon"]
-
-                        else:
-                            return self.image_cache[":directory_icon"]
                 else:
                     if (fileinfo_is_link(file_info)):
                         return self.image_cache[":file_link_icon"]
@@ -5019,6 +5102,65 @@ class DirectoryModel(QAbstractTableModel):
             elif ((self.it is not None) and (not self.it.isDone()) and (not self.directoryReader.isRunning())):
                 self.getFiles(True, create_it = False)
         
+    def sort(self, column, order):
+        # XXX Having the sort in the main model is not ideal since it modifies
+        #     the model for all the views, but since there's only one view per
+        #     model (actually two, the list and the table, having the same sort
+        #     is desirable since the list has no columns to sort by), this is ok
+        #     for the time being. The alternative is to use a proxy model on the
+        #     view, but that requires hooking all the extra source model
+        #     functionality in the proxymodel or mapping between one and the
+        #     other when necessary
+        
+        logger.info("column %d, order %s (0x%x)", column, EnumString(Qt, order), order)
+
+        # The sort order can be changed via actions or via clicking on headers,
+        # centralize here the current sort order, can also be obtained from the
+        # view header horizontalHeader().sortIndicatorSection() and
+        # horizontalHeader().sortIndicatorOrder())
+        self.sort_order = order
+        self.sort_column = column
+        # FileInfo: Filename, size, mtime, attr
+        # Model: Full filename, Filename, ext, size, date, attr
+        # XXX Missing sorting by extension
+        sort_field = 0 if (column <= 1) else (column - 2)
+        self.sort_field = sort_field
+
+        if (self.is_search_string):
+            self.setSearchString(self.file_dir)
+        
+        else:
+
+            self.layoutAboutToBeChanged.emit()
+
+            # Preserve the persistent indices (seem to be used among others for the
+            # selection model)
+            
+            persistent_indices = self.persistentIndexList()
+            logger.info("Building before sort %d persistent index mapping", len(persistent_indices))
+            row_mapping = {i: row for i, row in enumerate(self.file_infos)}
+
+            sort_fileinfos(self.file_infos, self.sort_field, self.sort_order)
+            
+            logger.info("Building after sort %d persistent index mapping", len(self.file_infos))
+            new_order = {id(row): i for i, row in enumerate(self.file_infos)}
+
+            # Rebuild persistent indexes
+            logger.info("Rebuilding %d persistent indices", len(persistent_indices))
+            for idx in persistent_indices:
+                old_row = idx.row()
+                new_row = new_order[id(row_mapping[old_row])]
+                idx_internal = self.index(new_row, idx.column())
+                self.changePersistentIndex(idx, idx_internal)
+            
+            # XXX The currentitem index is still valid, but the view is now showing
+            #     the old position (pressing cursors will bring the new index into
+            #     view), would need to scroll to the new value of the current index,
+            #     but that's a view thing, needs to hook on layoutChanged (or some
+            #     new signal)
+
+            self.layoutChanged.emit()
+
 class FixedWidthStyle(QCommonStyle):
     def __init__(self):
         super(FixedWidthStyle, self).__init__()
@@ -5347,7 +5489,7 @@ class FileTableView(QTableView):
 
 class FilePane(QWidget):
     directoryLabelChanged = pyqtSignal(str)
-    def __init__(self, display_width = DISPLAY_WIDTH, *args, **kwargs):
+    def __init__(self, display_width = DISPLAY_WIDTH, sort_column=1, sort_order=Qt.AscendingOrder, *args, **kwargs):
         logger.info("")
         super(FilePane, self).__init__(*args, **kwargs)
 
@@ -5449,6 +5591,13 @@ class FilePane(QWidget):
         self.table_view.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
         for i in xrange(4):
             self.table_view.horizontalHeader().setSectionResizeMode(i + 2, QHeaderView.ResizeToContents)
+        
+        # setSortingEnabled and sortByColumn below cause a double call to sort
+        # but here doesn't seem to be a way of avoding it
+        self.table_view.setSortingEnabled(True)
+        self.table_view.horizontalHeader().setSectionsClickable(True)
+        self.sortByColumn(sort_column, sort_order)
+        
         # Don't display row numbers
         self.table_view.verticalHeader().setVisible(False)
         # Shrink the row height to roughly font height
@@ -5468,7 +5617,7 @@ class FilePane(QWidget):
         self.table_view.setTabKeyNavigation(False)
         # Don't focus just on mouse wheel
         self.table_view.setFocusPolicy(Qt.StrongFocus)
-        
+
         # XXX Decide how to handle item editing (file renaming), right now it's
         #     done via a FilePane-level dialog box and reloadDirectory. The
         #     default Qt in place cell edit behavior is to modify the model,
@@ -5518,7 +5667,8 @@ class FilePane(QWidget):
             menu = QMenu()
             for col in xrange(model.columnCount()):
                 header = model.headerData(col, Qt.Horizontal)
-                action = menu.addAction(header, col)
+                action = menu.addAction(header)
+                action.setData(col)
                 action.setCheckable(True)
                 action.setChecked(not table.isColumnHidden(col))
             
@@ -5666,9 +5816,6 @@ class FilePane(QWidget):
             # the model has no way of knowing when to stop calling
             # beginInsertRows, since it has no knowledge of visible rows
 
-            # XXX Investigate listview elision not always working in incremental
-            #     mode/use_everything until icon size is changed or window resized?
-            
             for view in [self.table_view, self.list_view]:
                 if (view.model().canFetchMore(QModelIndex())):
                     # XXX A simpler check would be the vertical scrollbar? If
@@ -5711,8 +5858,8 @@ class FilePane(QWidget):
         
         self.list_view.setModel(self.model)
         
-        enable_sorting = False
-        if (enable_sorting):
+        enable_proxy_model_sorting = False
+        if (enable_proxy_model_sorting):
             # XXX This works but silently crashes when switching views and back
             #     in setCurrentIndex. Probably needs to be careful when using
             #     model() vs. sourceModel(). 
@@ -5765,6 +5912,28 @@ class FilePane(QWidget):
         #     signal handlers make, but has a UI delay when updating that is bad
         #     UX?
         self.model.modelReset.emit()
+
+    def sortByColumn(self, col, order):
+        """
+        Sort by column and order (Qt.AscendingOrder, Qt.DescendingOrder) if the
+        same as current, toggle
+        """
+        logger.info("col %d order %s (0x%x)", col, EnumString(Qt, order), order)
+
+        # Toggle if same column and order
+        if ((col == self.model.sort_column) and (order == self.model.sort_order)):
+            order = Qt.AscendingOrder if (self.model.sort_order == Qt.DescendingOrder) else Qt.DescendingOrder
+
+        # There's a bug for which QHeaderView "forgets" column visibility when
+        # sorting and the model is invalidated, restore
+        # XXX This should hook into header.sectionClicked.connect(save_and_restore_hidden_columns)
+        #     since the fix here won't fix it eg when clicking on column headers
+        hidden = [i for i in range(self.model.columnCount()) if self.table_view.isColumnHidden(i)]
+
+        self.table_view.sortByColumn(col, order)
+
+        for i in hidden:
+            self.table_view.setColumnHidden(i, True)
 
     def updateDirectoryLabel(self):
         logger.info("")
@@ -5887,6 +6056,14 @@ class FilePane(QWidget):
             locale.toString(selected_dirs),
             locale.toString(total_dirs)
         ))
+        
+        # The loading indicator is shown in the tab title, which takes from the
+        # directory label, update so it emits the change and the main app
+        # updates the tab
+        # XXX Do this more fine grain so it only updates when start and
+        #     stop the thread?
+        self.updateDirectoryLabel()
+
         logger.info("Done")
 
     def rateLimitedUpdateSummary(self):
@@ -5989,7 +6166,7 @@ class FilePane(QWidget):
         #     http:// and default to the Network pseudo directory
         self.networkDirAct = QAction('Network Directory', self, shortcut="ctrl+n", triggered= lambda : self.setDirectory(SHARE_ROOT), shortcutContext=Qt.WidgetWithChildrenShortcut)
         self.reloadDirAct = QAction('Reload Directory', self, shortcut="ctrl+r", triggered=lambda : self.reloadDirectory(), shortcutContext=Qt.WidgetWithChildrenShortcut)
-        self.reloadDirAct = QAction('Reload Directory and Caches', self, shortcut="ctrl+shift+r", triggered=lambda : self.reloadDirectory(True), shortcutContext=Qt.WidgetWithChildrenShortcut)
+        self.reloadAllAct = QAction('Reload Directory and Caches', self, shortcut="ctrl+shift+r", triggered=lambda : self.reloadDirectory(True), shortcutContext=Qt.WidgetWithChildrenShortcut)
         self.parentDirAct = QAction('Parent Directory', self, triggered=self.gotoParentDirectory, shortcutContext=Qt.WidgetWithChildrenShortcut)
         self.parentDirAct.setShortcuts(["backspace", "ctrl+PgUp"])
         self.childDirAct = QAction('Child Directory', self, shortcut="ctrl+PgDown", triggered=self.gotoChildDirectory, shortcutContext=Qt.WidgetWithChildrenShortcut)
@@ -5999,6 +6176,10 @@ class FilePane(QWidget):
         self.chooseDirectoryAct = QAction('Choose Directory', self, shortcut="alt+down", triggered=self.chooseHistoryDirectory, shortcutContext=Qt.WidgetWithChildrenShortcut)
         self.calculateSubdirSizesAct = QAction('Calculate Subdirectory Sizes', self, shortcut="space", triggered=lambda : self.calculateSubdirSizes(self.getActiveView().currentIndex()), shortcutContext=Qt.WidgetShortcut)
         self.calculateAllSubdirsSizesAct = QAction('Calculate All Subdirectory Sizes', self, shortcut="alt+shift+return", triggered=lambda : self.calculateSubdirSizes(), shortcutContext=Qt.WidgetShortcut)
+
+        self.sortByNameAct = QAction('Sort by name', self, shortcut="ctrl+F3", triggered=lambda : self.sortByColumn(1, self.model.sort_order), shortcutContext=Qt.WidgetWithChildrenShortcut)
+        self.sortByDateAct = QAction('Sort by date', self, shortcut="ctrl+F5", triggered=lambda : self.sortByColumn(4, self.model.sort_order), shortcutContext=Qt.WidgetWithChildrenShortcut)
+        self.sortBySizeAct = QAction('Sort by size', self, shortcut="ctrl+F6", triggered=lambda : self.sortByColumn(3, self.model.sort_order), shortcutContext=Qt.WidgetWithChildrenShortcut)
 
         self.toggleSearchModeAct = QAction('Toggle search mode', self, shortcut="ctrl+s", triggered=self.toggleSearchMode, shortcutContext=Qt.WidgetWithChildrenShortcut)
 
@@ -6032,6 +6213,7 @@ class FilePane(QWidget):
         self.addAction(self.openDirAct)
         self.addAction(self.networkDirAct)
         self.addAction(self.reloadDirAct)
+        self.addAction(self.reloadAllAct)
         self.addAction(self.parentDirAct)
         self.addAction(self.childDirAct)
         self.addAction(self.prevDirectoryAct)
@@ -6051,6 +6233,9 @@ class FilePane(QWidget):
         self.addAction(self.selectAllOrClearAct)
         self.addAction(self.openInExternalViewerAct)
         self.addAction(self.toggleSearchModeAct)
+        self.addAction(self.sortByNameAct)
+        self.addAction(self.sortByDateAct)
+        self.addAction(self.sortBySizeAct)
 
     def setCurrentIndex(self, index):
         logger.info("%d,%d", index.row(), index.column())
@@ -6485,6 +6670,10 @@ class FilePane(QWidget):
         #     with each entry
         #self.model.directoryReader.direntryRead.connect(lambda d, f: msg_box.setText("Reading directory %r\nEntry: %s" % (self.file_dir, f[0])))
         self.model.directoryReader.finished.connect(lambda : msg_box.close())
+        # The model already updates the summary when rows are added/deleted, but
+        # if no rows were added/deleted still need to update the loading
+        # indicator when the thread ends.
+        self.model.directoryReader.finished.connect(self.rateLimitedUpdateSummary)
         #self.model.directoryReader.finished.connect(lambda : self.table_view.resizeColumnsToContents())
         # Sleep a bit and then processEvents, this is a simple way of not
         # flashing the messagebox if listing the directory takes little time
@@ -6974,10 +7163,17 @@ class FilePane(QWidget):
                 self.setDirectory(file_dir)
 
     def reloadDirectory(self, clear_cache=False):
-        logger.info("clar_cache %s", clear_cache)
+        logger.info("clear_cache %s", clear_cache)
         # XXX This doesn't update the view sometimes, eg move a file into an
         #     empty directory and the directory will still show empty. Investigate
         self.model.reloadDirectory(clear_cache)
+        # The model already updates the summary when rows are added/deleted, but
+        # if not rows were added/deleted still need to update the loading
+        # indicator when the thread ends.
+        self.model.directoryReader.finished.connect(self.rateLimitedUpdateSummary)
+        # Update unconditionally in case the reader finished before setting the
+        # connect above (can't move the connect to the thread creation because 
+        # the model should have no knowledge of views)
         self.updateSummary()
 
     def pasteClipboardFiles(self):
@@ -7373,6 +7569,27 @@ class TwinWindow(QMainWindow):
         self.right_tab = QTabWidget(self)
 
         for tab in [self.left_tab, self.right_tab]:
+            def activate_and_choose_tab(tab, pos):
+                # XXX Pass the tab to chooseTab instead of activating the tab,
+                #     but it's a UI handler so it needs to be done in a way that
+                #     doesn't capture a possible handler parameter instead of
+                #     the tab to use
+                tab_bar = tab.tabBar()
+                tab_index = tab_bar.tabAt(pos)
+                if (tab_index == -1):
+                    return  # Clicked outside any tab
+                    
+                active_tab = self.left_tab if self.getLeftPane() is self.getActivePane() else self.right_tab
+                if (tab is not active_tab):
+                    self.getTargetPane().getActiveView().setFocus()
+
+                tab.setCurrentIndex(tab_index)
+
+                self.chooseTab()
+
+            tab.tabBar().setContextMenuPolicy(Qt.CustomContextMenu)
+            tab.tabBar().customContextMenuRequested.connect(lambda pos, tab=tab: activate_and_choose_tab(tab, pos))
+
             splitter.addWidget(tab)
             # XXX Only on 5.4+ 
             # tab.setTabBarAutoHide(True)
@@ -7422,7 +7639,12 @@ class TwinWindow(QMainWindow):
                 settings.setArrayIndex(i)
                 file_dir = settings.value("dirpath")
                 display_width = int(settings.value("display_width", DISPLAY_WIDTH))
-                file_pane = self.createPane(tab, display_width)
+                file_pane = self.createPane(
+                    tab, 
+                    display_width, 
+                    int(settings.value("sort_column", 1)), 
+                    int(settings.value("sort_order", Qt.AscendingOrder))
+                )
 
                 if (settings.value("mode") == "thumbnails"):
                     file_pane.switchView()
@@ -7439,7 +7661,7 @@ class TwinWindow(QMainWindow):
 
             settings.endArray()
 
-            i = int(settings.value("current_dirpath", 0))
+            i = int(settings.value("current_tab", 0))
             tab.setCurrentIndex(i)
 
             settings.endGroup()
@@ -7696,22 +7918,27 @@ class TwinWindow(QMainWindow):
         r_right = 0
         m_left = self.getLeftPane().getActiveView().model()
         m_right = self.getRightPane().getActiveView().model()
+        rc_left = m_left.rowCount()
+        rc_right = m_right.rowCount()
+
+        # Models are sorted by whatever column, sort the indices by name (no
+        # need for full fileinfo_cmp sorting as long as the loop below doesn't
+        # do it either)
+        si_left = sorted(xrange(rc_left), key= lambda i: m_left.data(m_left.index(i, 0), Qt.UserRole).filename.lower())
+        si_right = sorted(xrange(rc_right), key= lambda i: m_right.data(m_right.index(i, 0), Qt.UserRole).filename.lower())
         
         s_left = QItemSelection()
         s_right = QItemSelection()
         qApp.setOverrideCursor(Qt.WaitCursor)
-        while (True):
-            i_left = m_left.index(r_left, 0)
-            i_right = m_right.index(r_right, 0)
+        while ((r_left < rc_left) and (r_right < rc_right)):
 
-            if ((not i_left.isValid()) or (not i_right.isValid())):
-                break
+            i_left = m_left.index(si_left[r_left], 0)
+            i_right = m_right.index(si_right[r_right], 0)
 
             f_left = i_left.data(Qt.UserRole)
             f_right = i_right.data(Qt.UserRole)
 
-            # This assumes the models are sorted via fileinfo_cmp
-            c = fileinfo_cmp(f_left, f_right)
+            c = cmp(f_left.filename.lower(), f_right.filename.lower())
             assert None is logger.debug("Compared %d %r vs. %r", c,f_left.filename, f_right.filename)
 
             if (c == 0):
@@ -7745,13 +7972,15 @@ class TwinWindow(QMainWindow):
                 r_right += 1
 
         # Complete the selection with the remaining items if any
-        if (i_left.isValid()):
-            i_end = m_left.index(m_left.rowCount()-1, 0)
-            s_left.select(i_left, i_end)
+        while (r_left < rc_left):
+            i_left = m_left.index(si_left[r_left], 0)
+            s_left.select(i_left, i_left)
+            r_left += 1
 
-        elif (i_right.isValid()):
-            i_end = m_right.index(m_right.rowCount()-1, 0)
-            s_right.select(i_right, i_end)
+        while (r_right < rc_right):
+            i_right = m_right.index(si_right[r_right], 0)
+            s_right.select(i_right, i_right)
+            r_right += 1
 
         self.getLeftPane().getActiveView().selectionModel().select(s_left, QItemSelectionModel.Select | QItemSelectionModel.Rows)
         self.getRightPane().getActiveView().selectionModel().select(s_right, QItemSelectionModel.Select | QItemSelectionModel.Rows)
@@ -7836,7 +8065,7 @@ class TwinWindow(QMainWindow):
         # updateWindowTitle is called in eventFilter when focusIn is detected on
         # the pane, no need to explicitly call here
 
-    def createPane(self, tab, display_width=DISPLAY_WIDTH):
+    def createPane(self, tab, display_width=DISPLAY_WIDTH, sort_column=1, sort_order=Qt.AscendingOrder):
         logger.info("")
 
         def updateTabTitle(tab, file_pane, text):
@@ -7851,13 +8080,22 @@ class TwinWindow(QMainWindow):
                 text = basename if (basename != "") else (text if (text != "") else os.sep)
             
             index = tab.indexOf(file_pane)
+            
             tab.setTabText(index, text)
+
+            # XXX Rotate the icon on a timer, but it needs to know when not to
+            #     start the timer if already started, have a generic animation
+            #     timer that can be connected to for multiple animations?
+            loading = False if (file_pane.model.directoryReader is None) else file_pane.model.directoryReader.isRunning()
+            icon = qApp.style().standardIcon(QStyle.SP_BrowserReload) if loading else QIcon()
+            tab.setTabIcon(index, icon)
+            
             # Use full directory as tooltip
             if (not file_pane.search_mode):
                 text = file_pane.file_dir
             tab.setTabToolTip(index, text)
 
-        file_pane = FilePane(display_width)
+        file_pane = FilePane(display_width, sort_column, sort_order)
         
         if (tab is self.left_tab):
             self.left_panes.append(file_pane)
@@ -7886,6 +8124,9 @@ class TwinWindow(QMainWindow):
         menu = EditablePopupMenu(self, allow_check=False, allow_delete=True)
         action = menu.addAction("New tab")
         action.setData(tab.count())
+        closeTabAct = menu.addAction("Close tab")
+        if (tab.count() == 1):
+            closeTabAct.setEnabled(False)
         menu.addSeparator()
         for i in xrange(tab.count()):
             file_pane = tab.widget(i)
@@ -7900,8 +8141,11 @@ class TwinWindow(QMainWindow):
         tab_index_set = set([a.data() for a in menu.actions() if a.data() is not None])
 
         if (action is not None):
-            # XXX Make it so it opens the tab on the other pane if shift is pressed?
-            if ((action.data() == tab.count()) or (QApplication.keyboardModifiers() & Qt.ControlModifier)):
+            if (action is closeTabAct):
+                self.closeTab()
+
+            elif ((action.data() == tab.count()) or (QApplication.keyboardModifiers() & Qt.ControlModifier)):
+                # XXX Make it so it opens the tab on the other pane if shift is pressed?
                 # Create a new tab
                 logger.info("Creating and activating tab %d", action.data())
                 if (action.data() < tab.count()):
@@ -7909,7 +8153,7 @@ class TwinWindow(QMainWindow):
                     active_pane = tab.widget(action.data())
 
                 # XXX Insert after the current one?
-                file_pane = self.createPane(tab, active_pane.display_width)
+                file_pane = self.createPane(tab, active_pane.display_width, active_pane.model.sort_column, active_pane.model.sort_order)
                 
                 if (active_pane.search_mode):
                     file_pane.search_mode = True
@@ -8015,7 +8259,12 @@ class TwinWindow(QMainWindow):
             # Switch to that bookmark, in a new tab if ctrl is pressed
             if (QApplication.keyboardModifiers() & Qt.ControlModifier):
                 # XXX Insert after the current one?
-                active_pane = self.createPane(tab)
+                active_pane = self.createPane(
+                    tab, 
+                    active_pane.display_width, 
+                    active_pane.model.sort_column, 
+                    active_pane.model.sort_order
+                )
                 tab.setCurrentWidget(active_pane)
                 
             bookmark = action.data()
@@ -8065,6 +8314,8 @@ class TwinWindow(QMainWindow):
                 settings.setValue("dirpath", file_dir)
                 settings.setValue("mode", "thumbnails" if (file_pane.getActiveView() is file_pane.list_view) else "files")
                 settings.setValue("display_width", file_pane.display_width)
+                settings.setValue("sort_column", file_pane.model.sort_column)
+                settings.setValue("sort_order", file_pane.model.sort_order)
                 
                 settings.beginWriteArray("history")
                 for j, dirpath in enumerate(file_pane.dir_history):

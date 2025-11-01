@@ -57,10 +57,11 @@ PyQt5 twin panel file manager playground, but functional
 - Tabs
 - Bookmarks
 - Config file
+- Sorting by column
+- Directory background loading indicator on tab
 
 ## TODO
 
-- Sorting by column
 - Use multiprocessing instead of multithreading to avoid GIL UI blocking
 - Keyboard file filtering
 - Copy/move error overwrite reporting
@@ -100,4 +101,4 @@ Send files to other machines or devices in the local network with automatic devi
 
 ### kdiff3
 
-Extenral diff viewer (configurable)
+External diff viewer (configurable)

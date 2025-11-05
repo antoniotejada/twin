@@ -76,8 +76,8 @@ Limitations/disadvantages
 - Comparing directories will give wrong results if not all the items are loaded.
 - Scrollbar settings change as new rows are inserted
 - It's not a virtual list, all rowCount() elements are kept in memory, other
-  manual strategies are needed to lessen (evict images, emit dataChanged to
-  force a reload)
+  manual strategies are needed to lessen memory footprint (evict images, emit 
+  dataChanged to force a reload)
 
 
 
@@ -1698,10 +1698,15 @@ def localsend_upload_to_device(myinfo, device, filepath):
 # 0.1.0 
 # - Sorted columns, loading indicator, choosetab on right click
 # - Fixes to current_tab settings, headerChooser crash, stale image crash
-APPLICATION_VERSION = "0.1.0"
+# 0.2.0
+# - Added filtering, search tab icon, shortcuts in config, rotating loading icon
+# - Fixed DirectoryReader loop, dir_infos_set initialization, search tooltip 
+#   after toggling search
+APPLICATION_VERSION = "0.2.0"
 # 0.0.1 Added config file
 # 0.1.0 Added sorting settings
-CONFIG_FILE_VERSION = "0.1.0"
+# 0.2.0 Added filter, shortcut settings
+CONFIG_FILE_VERSION = "0.2.0"
 
 INCLUDE_DIR = "include"
 TEMP_DIR = os.path.join("_out", "temp")
@@ -1826,6 +1831,84 @@ def qFindMainWindow():
             return widget
     return None
 
+def qInsertDialogWidget(dialog, widget, index):
+    """
+    Insert a widget in a dialog at the given layout index position.
+
+    Use:
+    - index = None to append
+    - index = 0 to insert at the beginning
+    - index = -1 to insert between last and prev to last
+    - index = -2 for prev to prev to last and prev to last
+    - etc
+    """
+    layout = dialog.layout()
+    i = layout.count() if (index is None) else (index if (index >= 0) else (layout.count() + index))
+    layout.insertWidget(i, widget)
+
+    # At least on QInputDialog, the tab order is not recalculated when a new
+    # widget is added, make the tab order of this widget be the layout order
+    dialog.setTabOrder(layout.itemAt(i-1).widget(), layout.itemAt(i).widget())
+    dialog.setTabOrder(layout.itemAt(i).widget(), layout.itemAt(i+1).widget())
+
+def qSettingsValue(settings, key, default=None):
+    """
+    Settings store strings and settings.value type= parameter can be used to
+    cast, simplify by using use the default value type to return the right value
+    """
+    if (default is None):
+        return settings.value(key, default)
+
+    else:
+        return settings.value(key, default, type=type(default))
+
+def qSaveActionShortcuts(settings, widget, group="shortcuts"):
+    """Save all QAction shortcuts from the given widget into QSettings."""
+    logger.info("group %s", group)
+    settings.beginGroup(group)
+    # Save only direct children actions, this prevents finding actions from
+    # stale popup menus
+    # XXX Investigate why there are stale EditablePopupMenus
+    for action in widget.findChildren(QAction, options=Qt.FindDirectChildrenOnly):
+        # XXX Go through actions and set an immutable object name, fall back to 
+        #     the text for now
+        name = action.objectName() or action.text()
+        if (name != ""):
+            # Forward slashes in keys are regarded as hierarchy, escape them
+            name = name.replace("/", "^")
+            shortcuts = string.join([shortcut.toString() for shortcut in action.shortcuts()], " ")
+            logger.info("saving action %r shortcuts %r", name, shortcuts)
+            # Store as space-separated list, no need to escape since spaces are
+            # encoded as "Space" for shortcuts
+            settings.setValue(name, shortcuts)
+    settings.endGroup()
+
+def qRestoreActionShortcuts(settings, widget, group="shortcuts"):
+    """Restore all QAction shortcuts from QSettings into the given widget."""
+    logger.info("group %s", group)
+    settings.beginGroup(group)
+    for action in widget.findChildren(QAction):
+        name = action.objectName() or action.text()
+        if (name != ""):
+            # Forward slashes in keys are regarded as hierarchy, unescape them
+            name = name.replace("/", "^")
+            value = settings.value(name)
+            if (value is not None):
+                parts = [p for p in value.split() if p]
+                sequences = [QKeySequence(p) for p in parts]
+                logger.info("restoring action %r shortcuts to %s", name, [s.toString() for s in sequences])
+                action.setShortcuts(sequences)
+    settings.endGroup()
+
+def qTabWidgetFromPage(pageWidget):
+    """Given a widget inside a QTabWidget, return the QTabWidget"""
+    logger.info("")
+    # Note the hierarchy is FilePane->QStackWidget-> QTabWidget
+    tab = pageWidget.parent().parent()
+    assert issubclass(type(tab), QTabWidget)
+
+    return tab
+    
 def qResizePixmap(pixmap, target_width, target_height):
     """
         Scale the given pixmap to the target size, preserving aspect ratio, and
@@ -3633,8 +3716,8 @@ class CsvFileInfoIterator(FileInfoIterator):
     def isDone(self):
         return self.done
 
-class FileSearchFileInfoIterator(FileInfoIterator):
-    def __init_(*args, **kwargs):
+class FilterFileInfoIterator(FileInfoIterator):
+    def __init__(self, it, filter_string, ignore_case, *args, **kwargs):
         """
         
         Scenarios:
@@ -3659,7 +3742,62 @@ class FileSearchFileInfoIterator(FileInfoIterator):
         - No search string
         - Search string 
         """
-        raise NotImplementedError
+        logger.info("%r case %s", filter_string, ignore_case)
+        
+        self.it = it
+        
+        # Hook extra methods if available in the underlying iterator, don't add
+        # the functions unconditionally since the code checks for the attribute
+        # to exist in order to take one action or another
+        # XXX Do this in a better way, don't hasattr in the code to check for
+        #     presence, add it to the baseclass and make it transparent with a
+        #     default implementation
+        if (hasattr(it, "mkDir")):
+            self.mkDir = it.mkDir
+        if (hasattr(it, "executeFile")):
+            self.executeFile = it.executeFile
+        if (hasattr(it, "extract")):
+            self.extract = it.extract
+
+        self.re = re.compile(filter_string, re.IGNORECASE if ignore_case else 0)
+        
+    def getFileInfos(self, batch_size=0):
+        logger.info("")
+        
+        # Don't return empty fileinfos until all the underlying iterator returns
+        # empty fileinfos
+
+        # XXX Cache the underlying iterator unfiltered results? Would be useful
+        #     in order to filter the same file_dir under new parameters. Would
+        #     need the caller to retain the FilterFileInfoIterator and be able
+        #     to set a new regexp. Would also need a way to clear the cache
+        #     (or just recreate the FilterFileInfoIterator), probably on
+        #     directory reload/change
+        all_file_infos = []
+        while (True):
+            dir_infos_set, file_infos = self.it.getFileInfos(batch_size)
+
+            if (len(file_infos) == 0):
+                break
+
+            # Match the regexp and exclude ".."
+            file_infos = filter(lambda f: (self.re.search(f.filename) is not None) and (os.path.basename(f.filename) != ".."), file_infos)
+
+            all_file_infos.extend(file_infos)
+            
+            if (len(all_file_infos) >= batch_size):
+                break
+
+        file_infos = all_file_infos
+            
+        dir_infos_set = set([file_info for file_info in file_infos if fileinfo_is_dir(file_info)])
+
+        logger.info("Filtered %d file_infos %d dir_infos", len(file_infos), len(dir_infos_set))
+
+        return dir_infos_set, file_infos
+
+    def isDone(self):
+        return self.it.isDone()
 
 def safe_unicode(s):
     """
@@ -3699,6 +3837,10 @@ class EditablePopupMenu(QMenu):
         # XXX Should allow passing a minimum number of undeleted options? (some
         #     callers allow deleting all, some must leave at least one
         #     undeleted?)
+        # XXX Allow giving options shortnames if space is pressed on an option
+        #     and checking options is disabled? Then also allow navigating via
+        #     initials/prefix/substring without committing until return is
+        #     pressed. Setting the empty string, goes back to original name
         super(EditablePopupMenu, self).__init__(parent)
         self.allow_delete = allow_delete
         self.allow_check = allow_check
@@ -3712,7 +3854,10 @@ class EditablePopupMenu(QMenu):
 
         if (auto_number):
             shortcuts = string.digits + string.ascii_uppercase
-            title = "&%s. %s" % (shortcuts[self.next_number], title)
+            title = "%s%s" % (
+                ("&%s. " % shortcuts[self.next_number]) if (self.next_number < len(shortcuts)) else "    ", 
+                title
+            )
             self.next_number += 1
 
         action = super(EditablePopupMenu, self).addAction(title)
@@ -3773,6 +3918,17 @@ class EditablePopupMenu(QMenu):
 class DirectoryReader(QThread):
     direntryRead = pyqtSignal(set, list)
     def __init__(self, dirpath, batch_size = 0, parent=None, it=None, loop=True):
+        """
+        @param loop indicates whether to loop until all the entries are produced
+        or just loop for one batch to be produced and then call the same
+        iterator to resume.
+
+        loop is used in conjunction with iterators that support batching,
+        resuming, and incremental row loading. This prevents blocking the UI for
+        long periods of time if the reader is working in single thread, or in
+        mergeDirEntries when a large amount of fileinfos are sent to the model.
+        """
+        logger.info("dirpath %r batch_size %d it %s loop %s", dirpath, batch_size, it, loop)
         super(DirectoryReader, self).__init__(parent)
         self.dirpath = dirpath
         self.batch_size = batch_size
@@ -3993,6 +4149,11 @@ class DirectoryModel(QAbstractTableModel):
         self.dir_infos_set = set()
         self.is_search_string = False
 
+        # Filter string regexp pattern (call re.escape to provide a non-pattern)
+        self.filter_string = ""
+        self.filter_recurse = True
+        self.filter_ignore_case = True
+        
         # XXX These are actually stored on the headerview, remove if using
         #     proxymodel?
         self.sort_order = None
@@ -4000,6 +4161,7 @@ class DirectoryModel(QAbstractTableModel):
         self.sort_column = None
 
         self.it = None
+        self.loop_it = True
 
         self.initCache()
         
@@ -4117,9 +4279,9 @@ class DirectoryModel(QAbstractTableModel):
         file_dir = file_dir_or_search
         file_dir_lower = file_dir.lower()
         it = None
-        # XXX Read installed wcx/wfx from a config file, could also discover from
-        #     plugin directory and use CanYouHandleThisFile, but that's an optional
-        #     function
+        # XXX Read installed wcx/wfx from a config file, could also discover
+        #     from plugin directory and use CanYouHandleThisFile, but that's an
+        #     optional function
         
         # XXX This is likely to be the same iterator that is current, have some
         #     state that remembers which iterator it came from or a hint of what
@@ -4134,6 +4296,11 @@ class DirectoryModel(QAbstractTableModel):
             #     hooking the total commander ones
             # WFXInfo(SHARE_ROOT + "\\ftp", R"_out\ftp\ftp.wfx"),
         ]
+
+        if (self.filter_string != ""):
+            # Recurse can be true if the caller desires to recurse (eg directory
+            # size calculation), don't override it
+            recurse = recurse or self.filter_recurse
             
         if (is_search_string):
             it = EverythingFileInfoIterator(file_dir, sort_field=self.sort_field, sort_reverse=(self.sort_order == Qt.DescendingOrder))
@@ -4201,18 +4368,74 @@ class DirectoryModel(QAbstractTableModel):
             else:
                 # XXX This is hit when there's a permission violation accessing
                 #     a real directory. Should probably raise and the caller
-                #     retry the parent directory. Doing it befhore hand is hard
+                #     retry the parent directory. Doing it beforehand is hard
                 #     because there are many ad-hoc paths that are not real
                 #     directories but are valid to switch to (virtual archive
                 #     paths, network plugin paths...)
                 assert zipfile.is_zipfile(arcpath)
                 it = ZipFileInfoIterator(arcpath, dirpath, recurse)
                 
+        if (self.filter_string != ""):
+            # Wrap the selected iterator in a FilterFileInfoIterator with the
+            # desired options
+            # XXX This is not efficient, it should filter the current fileinfos
+            #     rather than relisting again and only relist if reload is used?
+            #     But if recurse is set it cannot reuse a regular iterator that
+            #     normally don't recurse, but it could still reuse previous 
+            #     unfiltered results
+            it = FilterFileInfoIterator(it, self.filter_string, self.filter_ignore_case)
+            # Don't loop, with recurse there can be many results, both load
+            # incrementally and resume iterator
+            # XXX Make this conditional on recurse?
+            loop = True
+
         return it, loop
 
+    def setFilterString(self, file_dir, is_search_string, filter_string, recurse, ignore_case):
+        logger.info("%r", filter_string)
+
+        self.filter_string = filter_string
+        self.filter_recurse = recurse
+        self.filter_ignore_case = ignore_case
+
+        # Doing self.reloadDirectory() to refresh the filter string is the
+        # easiest because it doesn't require to fiddle with search_string vs.
+        # non search_string or any other future states, but it has the
+        # disadvantage of
+        # - it's treated as an update to the current dir (insert_only False),
+        #   this means there's no batching and the results don't appear until
+        #   the search is done
+        # - the loading indicator is not updated because there are no updates
+        #   until the search is done (not clear this is true?)
+        
+        # XXX With both setSearchString and setDirectory, there's no
+        #   cancel/background dialog box because the cancel is done at a higher
+        #   level, rethink? Interestingly, there's background/cancel if
+        #   navigating to a directory with the filter on, since filter on is
+        #   transparent to the higher level. Similarly, the not ideal reload
+        #   behavior is back when reload is used on a filtered directory
+
+        # XXX Verify that any currently running filter is stopped
+        
+        # XXX Local listings are not using incremental load and block the UI,
+        #     even when it shows, the background/cancel dialog box is
+        #     unresponsive, investigate
+        # XXX There are two points of slowness:
+        #     - the filtering iterator signal overhead, this is lessened
+        #       honoring batch_size in the filteriterator 
+        #     - mergeDirEntries can be very slow with lots of batches/results,
+        #       this should use an approach similar to sort where entries are 
+        #       sorted and added wholesale and only permanent indices are 
+        #       preserved
+            
+        if (is_search_string):
+            self.setSearchString(file_dir)
+
+        else:
+            self.setDirectory(file_dir)
 
     def getFiles(self, insert_only = False, create_it=True):
-        logger.info("reading dir")
+        logger.info("reading dir insert_only %s create_it %s", insert_only, create_it)
 
         def receive_direntry(dir_infos_set, file_infos):
             
@@ -4251,15 +4474,14 @@ class DirectoryModel(QAbstractTableModel):
         
         # XXX This gets blocked behind image load, pause image loading while
         #     entries are being read
-        loop = True
         # XXX Create the iterator in the filepane? But DirectoryModel.reload
         #     needs to reset the iterator
         # create_it will be False when resuming a previous getFiles
         if (create_it):
-            self.it, loop = self.createIterator(self.file_dir, self.is_search_string)
+            self.it, self.loop_it = self.createIterator(self.file_dir, self.is_search_string)
         
         # XXX Is self.it ever None?
-        self.directoryReader = DirectoryReader(self.file_dir, 500 if insert_only else 0, it=self.it, loop=True if (self.it is None) else loop)
+        self.directoryReader = DirectoryReader(self.file_dir, 500 if insert_only else 0, it=self.it, loop=True if (self.it is None) else self.loop_it)
         self.directoryReader.direntryRead.connect(receive_direntry)
         single_thread = (force_single_thread or 
             (force_wfx_single_thread and isinstance(self.it, WFXFileInfoIterator)) or
@@ -4710,9 +4932,15 @@ class DirectoryModel(QAbstractTableModel):
 
         self.file_dir = file_dir
         self.is_search_string = is_search_string
-        self.use_incremental_row_loading = self.is_search_string
+        
+        # XXX Incremental row loading doesn't seem to kick in for filters and
+        #     mergeDirEntries takes forever (and blocks the UI) on recursive
+        #     filters with lots of files, find out why. Should mergeDirEntries
+        #     just invalidate the model?
+        self.use_incremental_row_loading = self.is_search_string or (self.filter_string != "")
         self.loaded_rows = 0
         self.file_infos = []
+        self.dir_infos_set = set()
         if (self.is_search_string):
             logger.info("Not watching search string")
             self.watcher = None
@@ -4721,7 +4949,7 @@ class DirectoryModel(QAbstractTableModel):
             logger.info("Watching dir %r", watch_dir)
             # XXX This doesn't watch recursively and it won't watch new directories
             #     (which may be ok since the panel doesn't display a directory
-            #     recursively and the signa will still trigger if some parent is
+            #     recursively and the signal will still trigger if some parent is
             #     deleted?)
             self.watcher = QFileSystemWatcher([watch_dir])
             # XXX What if the directory (or file in case of archives) is removed? or
@@ -4737,14 +4965,7 @@ class DirectoryModel(QAbstractTableModel):
 
     def setSearchString(self, search_string):
         logger.info("%r", search_string)
-        # XXX The merge files path is not necessary, remove
-        merge_entries = False
-        if (merge_entries):
-            self.file_dir = search_string
-            self.is_search_string = True
-            self.getFiles(False)
-        else:
-            self.setDirectory(search_string, True)
+        self.setDirectory(search_string, True)
 
     def cacheImage(self, key, pixmap):
         """
@@ -5090,7 +5311,7 @@ class DirectoryModel(QAbstractTableModel):
                     #     items per row, so Qt always find an available item below the
                     #     rightmost items.
                 
-                    # Always load the directories            
+                    # Always load the directories
                     next_loaded_rows = min(max(self.loaded_rows, len(self.dir_infos_set)) + self.page_size - (self.loaded_rows % self.page_size), len(self.file_infos))
                 else:
                     next_loaded_rows = len(self.file_infos)
@@ -5496,7 +5717,7 @@ class FilePane(QWidget):
         self.dir_history = []
         self.current_dir_history = -1
         self.search_mode = False
-        self.old_file_dir = None
+        self.old_file_dir = os.getcwd()
 
         self.search_string = ""
         self.search_string_display_ms = SEARCH_STRING_DISPLAY_TIME_MS
@@ -5504,6 +5725,15 @@ class FilePane(QWidget):
         self.search_string_timer.setSingleShot(True)
         self.search_string_timer.timeout.connect(self.resetSearchString)
 
+        self.loading_animation_timer = None
+        # self.loading_animation_timer.setSingleShot(True)
+        self.loading_animation_angle = 0
+
+        # Filter string as entered in the dialog box, may be different from the
+        # one in the model since the one in the model is escaped for RegExp
+        self.filter_string = ""
+        self.filter_is_regexp = True
+        
         self.display_width = display_width
 
         self.file_dir = None
@@ -5793,7 +6023,8 @@ class FilePane(QWidget):
         qRateLimitCall(self.mergeDirSizeExt, 10)
 
     def fetchMoreIfVisible(self):
-        if (use_incremental_row_loading or self.search_mode):
+        # XXX Needs to look at filter too?
+        if (use_incremental_row_loading or self.model.use_incremental_row_loading):
             logger.info("")
             # Always load a full viewport worth of rows, otherwise when:
             # - The view is showing all the available rows, canFetchMore has
@@ -5913,6 +6144,55 @@ class FilePane(QWidget):
         #     UX?
         self.model.modelReset.emit()
 
+
+    def filterFiles(self):
+        logger.info("")
+
+        # Use a standard inputdialog and add a checkbox
+        dialog = QInputDialog(self)
+        dialog.setWindowTitle("Filter Files")
+        dialog.setLabelText("Filter String (empty to disable):")
+        dialog.setTextValue(self.filter_string)
+        
+        dialog.setOkButtonText("OK")
+        dialog.setCancelButtonText("Cancel")
+
+        # Insert checkbox into dialog's layout before the buttons, which are the
+        # last widget
+
+        regexpCheckbox = QCheckBox("Use RegExp", dialog)
+        regexpCheckbox.setChecked(self.filter_is_regexp)
+        qInsertDialogWidget(dialog, regexpCheckbox, -1)
+
+        recurseCheckbox = QCheckBox("Recurse", dialog)
+        recurseCheckbox.setChecked(self.model.filter_recurse)
+        qInsertDialogWidget(dialog, recurseCheckbox, -1)
+        
+        caseCheckbox = QCheckBox("Ignore Case", dialog)
+        caseCheckbox.setChecked(self.model.filter_ignore_case)
+        qInsertDialogWidget(dialog, caseCheckbox, -1)
+        
+        # XXX Missing other options like
+        #     - recurse (max depth?)
+        #     - recurse into packed files
+        #     - search in contents
+        #     - search in selection
+        #     - only files (don't show dirs)
+        #     - find duplicates
+        #    Roll a full featured QDialog from scratch
+
+        if (dialog.exec_() == QInputDialog.Accepted):
+            self.setFilterString(self.file_dir, self.search_mode, dialog.textValue(), 
+                regexpCheckbox.isChecked(), recurseCheckbox.isChecked(), 
+                caseCheckbox.isChecked())
+            
+            # Update the tab so the filtering indicator shows/hides in case it
+            # was enabled/disabled
+            # XXX The loading indicator shows until directory reload when there
+            #     are no results, fix
+            # XXX The columns are not resized to contents properly, fix
+            self.updateDirectoryLabel()
+
     def sortByColumn(self, col, order):
         """
         Sort by column and order (Qt.AscendingOrder, Qt.DescendingOrder) if the
@@ -6008,12 +6288,14 @@ class FilePane(QWidget):
                     total_number_of_free_bytes = ctypes.c_ulonglong(0)
 
                     # Call GetDiskFreeSpaceExW to get the disk space details
+                    logger.info("Calling GetDiskFreeSpaceExW")
                     result = GetDiskFreeSpaceExW(
                         root_path, 
                         ctypes.byref(free_bytes_available),
                         ctypes.byref(total_number_of_bytes),
                         ctypes.byref(total_number_of_free_bytes)
                     )
+                    logger.info("Called GetDiskFreeSpaceExW")
                     total_bytes = total_number_of_bytes.value
                     free_bytes = free_bytes_available.value
                 except Exception as e:
@@ -6032,6 +6314,7 @@ class FilePane(QWidget):
         total_files = 0 
         total_dirs = 0 
         
+        logger.info("Calculating total and selected sizes")
         for row in xrange(self.model.rowCount()):
             index = self.model.index(row, 3)
             file_info = index.data(Qt.UserRole)
@@ -6046,6 +6329,7 @@ class FilePane(QWidget):
                 total_files += 1
             total_size += size
             selected_size += size if is_selected else 0
+        logger.info("Calculated total and selected sizes")
             
         self.summary_label.setText("%s k / %s k in %s / %s files, %s / %s dirs" % (
             # XXX Show the selected size in smaller units?
@@ -6080,6 +6364,8 @@ class FilePane(QWidget):
         else:
             # XXX Store the old search string?
             self.file_dir = self.old_file_dir
+            # Reset so the search tooltip doesn't appear
+            self.search_string = ""
             self.setDirectory(self.file_dir)
 
     def resetSearchString(self):
@@ -6115,6 +6401,7 @@ class FilePane(QWidget):
         if (self.search_mode):
             self.file_dir = search_string
             self.updateDirectoryLabel()
+            # XXX This should use a signal instead of hijacking the main window
             qFindMainWindow().updateWindowTitle()
             # Don't redo the search if only a space was added, this makes
             # spacebar selection be less disruptive when search is on, while at
@@ -6125,6 +6412,9 @@ class FilePane(QWidget):
     def searchEverything(self):
         try:
             self.model.setSearchString(self.file_dir)
+            
+            # XXX Search string normally doesn't use a thread, so it fails to
+            #     display the loading indicator, fix?
             
         except Exception as e:
             QMessageBox.critical(
@@ -6145,6 +6435,48 @@ class FilePane(QWidget):
         #self.table_view.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
         #for i in xrange(4):
         #    self.table_view.horizontalHeader().setSectionResizeMode(i + 2, QHeaderView.ResizeToContents)
+
+    def setFilterString(self, file_dir, search_mode, filter_string, is_regexp, recurse, ignore_case):
+        logger.info("file_dir %r search_mode %s filter_string %r is_regexp %s recurse %s ignore_case %s", 
+            file_dir, search_mode, filter_string, is_regexp, recurse, ignore_case)
+
+        # Make sure the regexp is valid so it doesn't raise deep in the
+        # FilterFileInfoIterator
+        try:
+            filter_pattern = filter_string if is_regexp else re.escape(filter_string)
+            re.compile(filter_pattern, re.IGNORECASE if ignore_case else 0)
+
+        except Exception as e:
+            # XXX Compile this in the UI side of things to test and warn the user?
+            logger.warn("Error compiling filter regexp %r %r", filter_pattern, e)
+
+            QMessageBox.warning(
+                self, "Filter Files", "Invalid regular expression '%r'" % filter_pattern,
+                buttons=QMessageBox.Ok,
+                defaultButton=QMessageBox.Ok
+            )
+            return
+
+        
+        self.filter_is_regexp = is_regexp
+        self.filter_string = filter_string
+
+        # XXX Should the model just set state in setFilterString and then the
+        #     callers use setDirectory or setSearchString? That can simplify
+        #     things, eg right now this is assuming the search mode doesn't
+        #     change since it doesn't set any related FilePane state that may be
+        #     set in eg searchEverything/setSearchString/setDirectory
+        self.file_dir = file_dir
+        self.model.setFilterString(file_dir, search_mode, filter_pattern, recurse, ignore_case)
+
+        # The model already updates the summary when rows are added/deleted, but
+        # if not rows were added/deleted still need to update the loading
+        # indicator when the thread ends.
+        self.model.directoryReader.finished.connect(self.rateLimitedUpdateSummary)
+        # Update unconditionally in case the reader finished before setting the
+        # connect above (can't move the connect to the thread creation because 
+        # the model should have no knowledge of views)
+        self.updateSummary()
 
     def setupActions(self):
         # Override the default tableview copy action which only copies the
@@ -6180,6 +6512,9 @@ class FilePane(QWidget):
         self.sortByNameAct = QAction('Sort by name', self, shortcut="ctrl+F3", triggered=lambda : self.sortByColumn(1, self.model.sort_order), shortcutContext=Qt.WidgetWithChildrenShortcut)
         self.sortByDateAct = QAction('Sort by date', self, shortcut="ctrl+F5", triggered=lambda : self.sortByColumn(4, self.model.sort_order), shortcutContext=Qt.WidgetWithChildrenShortcut)
         self.sortBySizeAct = QAction('Sort by size', self, shortcut="ctrl+F6", triggered=lambda : self.sortByColumn(3, self.model.sort_order), shortcutContext=Qt.WidgetWithChildrenShortcut)
+
+        self.filterAct = QAction('Filter Files', self, shortcut="ctrl+f", triggered=self.filterFiles, shortcutContext=Qt.WidgetWithChildrenShortcut)
+        self.filterAct.setShortcuts(["ctrl+f", "alt+f7"])
 
         self.toggleSearchModeAct = QAction('Toggle search mode', self, shortcut="ctrl+s", triggered=self.toggleSearchMode, shortcutContext=Qt.WidgetWithChildrenShortcut)
 
@@ -6236,6 +6571,7 @@ class FilePane(QWidget):
         self.addAction(self.sortByNameAct)
         self.addAction(self.sortByDateAct)
         self.addAction(self.sortBySizeAct)
+        self.addAction(self.filterAct)
 
     def setCurrentIndex(self, index):
         logger.info("%d,%d", index.row(), index.column())
@@ -6555,7 +6891,7 @@ class FilePane(QWidget):
         """
         file_info = self.getActiveView().currentIndex().data(Qt.UserRole)
         logger.info("%r", file_info)
-        if ((file_info is not None) and ((self.isForciblyBrowsable(file_info)) or self.search_mode)):
+        if ((file_info is not None) and ((self.isForciblyBrowsable(file_info)) or (self.search_mode or (self.filter_string != "")))):
             # XXX This is replicated in itemactivated, refactor?
             if (self.search_string_timer.isActive()):
                 logger.info("Resetting search_string")
@@ -6637,7 +6973,9 @@ class FilePane(QWidget):
                 break
             file_dir = parent_dir
 
-        old_file_dir = self.file_dir
+        # XXX self.file_dir will be None at initialization, initialize
+        #     self.file_dir to os.cwd and remove all checks?
+        old_file_dir = self.file_dir or self.old_file_dir
 
         # Disable search mode
         # XXX Should search strings be pushed to history?
@@ -6647,13 +6985,23 @@ class FilePane(QWidget):
             self.search_string_timer.stop()
             self.search_string_timer.timeout.emit()
 
+        # Disable filters
+        # XXX Should filters be pushed to history?
+        if (self.filter_string != ""):
+            self.filter_string = ""
+            # Access the model fields directly instead of calling setSearchString 
+            # to prevent a double listing
+            # XXX Make so DirectoryModel.setSearchString doesn't cause a
+            #     directory listing?
+            self.model.filter_string = ""
+
         self.file_dir = file_dir
         # XXX This should use a signal instead of hijacking the main window
         qFindMainWindow().updateWindowTitle()
         self.updateDirectoryLabel()
         
-        # Don't add identical consecutive entries (can happen with left to
-        # right, ctrl+d to the same dir, etc)
+        # Don't add identical consecutive entries to history (can happen with
+        # left to right, ctrl+d to the same dir, etc)
         if (add_to_history and ((len(self.dir_history) == 0) or (self.dir_history[self.current_dir_history] != file_dir))):
             self.current_dir_history += 1
             # Clamp history/append entry as necessary
@@ -6735,8 +7083,7 @@ class FilePane(QWidget):
 
         index = self.createRootIndex()
         # If going up to the parent directory, focus on the children just left
-        # (guard against old_file_dir which will be none at app startup)
-        if ((old_file_dir is not None) and (os.path.dirname(old_file_dir) == self.file_dir)):
+        if (os.path.dirname(old_file_dir) == self.file_dir):
             # Focus on the incoming dir, could fail if didn't sleep enough time
             # to list this directory, or if it didn't sleep enough to increase
             # loaded_rows 
@@ -6790,8 +7137,7 @@ class FilePane(QWidget):
             
                 except ValueError:
                     logger.info("Can't scrollTo")
-            if (old_file_dir is not None):
-                QTimer.singleShot(0, lambda : scrollToIndex(index, old_file_dir))
+            QTimer.singleShot(0, lambda : scrollToIndex(index, old_file_dir))
 
     def itemActivated(self, index):
         if (self.search_string_timer.isActive()):
@@ -7555,6 +7901,10 @@ class TwinWindow(QMainWindow):
         #     tweaking, eventually move to native
         self.settings = QSettings('twin.ini', QSettings.IniFormat)
 
+        # Create a copy that will be used to navigate the hierarchy, this allows
+        # components to access the global settings while this code is iterating
+        settings = QSettings('twin.ini', QSettings.IniFormat)
+
         self.setupActions()
 
         self.profiling = False
@@ -7605,18 +7955,21 @@ class TwinWindow(QMainWindow):
         #     file_dir like updateDirectoryLabel which until worked around would
         #     cause a silent crash in directoryLabelChanged emitting None, maybe
         #     others fix?
-        settings = self.settings
         file_dirs_panes = []
 
         # Root items on ini files will go in the "General" group, trying to use
         # "general" as a group will be escaped into "#general". Just use the
         # root group for simplicity
-        current_pane = settings.value("current_pane", "left")
+        current_pane = qSettingsValue(settings,"current_pane", "left")
 
-        self.setGeometry(settings.value("window_geometry", QRect(0,0,1024,768)))
+        self.setGeometry(qSettingsValue(settings,"window_geometry", QRect(0,0,1024,768)))
 
-        g_external_viewer_filepath = settings.value("external_viewer_filepath", g_external_viewer_filepath)
-        g_external_diff_filepath = settings.value("external_diff_filepath", g_external_diff_filepath)
+        g_external_viewer_filepath = qSettingsValue(settings,"external_viewer_filepath", g_external_viewer_filepath)
+        g_external_diff_filepath = qSettingsValue(settings,"external_diff_filepath", g_external_diff_filepath)
+
+        # Load keyboard shortcuts from settings, panel and tableview shortcuts
+        # are loaded at panel creation time
+        qRestoreActionShortcuts(self.settings, self)
 
         # Note QSettings child/key enumeration doesn't guarantee a specific
         # order, use beginWriteArray/beginReadArray for all settings that
@@ -7626,7 +7979,7 @@ class TwinWindow(QMainWindow):
         count = settings.beginReadArray("bookmarks")
         for i in xrange(count):
             settings.setArrayIndex(i)
-            self.bookmarks.append(settings.value("dirpath"))
+            self.bookmarks.append(qSettingsValue(settings, "dirpath"))
         settings.endArray()
 
         for tab_name in ["left", "right"]:
@@ -7637,31 +7990,42 @@ class TwinWindow(QMainWindow):
             for i in xrange(count):
                 logger.info("Restoring tab %s pane %s", tab_name, i)
                 settings.setArrayIndex(i)
-                file_dir = settings.value("dirpath")
-                display_width = int(settings.value("display_width", DISPLAY_WIDTH))
+                file_dir = qSettingsValue(settings, "dirpath")
+                display_width = qSettingsValue(settings, "display_width", DISPLAY_WIDTH)
                 file_pane = self.createPane(
                     tab, 
                     display_width, 
-                    int(settings.value("sort_column", 1)), 
-                    int(settings.value("sort_order", Qt.AscendingOrder))
+                    qSettingsValue(settings, "sort_column", 1), 
+                    qSettingsValue(settings, "sort_order", Qt.AscendingOrder)
                 )
 
-                if (settings.value("mode") == "thumbnails"):
+                file_pane.filter_string = qSettingsValue(settings, "filter_string", file_pane.filter_string)
+                file_pane.filter_is_regexp = qSettingsValue(settings, "filter_is_regexp", file_pane.filter_is_regexp)
+
+                # XXX Poking into the model this way is not nice, but it's only
+                #     needed to hold the values until used below in the second
+                #     initialization step, fix?
+                filter_pattern = file_pane.filter_string if file_pane.filter_is_regexp else re.escape(file_pane.filter_string)
+                file_pane.model.filter_string = filter_pattern
+                file_pane.model.filter_recurse = qSettingsValue(settings, "filter_recurse", file_pane.model.filter_recurse)
+                file_pane.model.filter_ignore_case = qSettingsValue(settings, "filter_ignore_case", file_pane.model.filter_ignore_case)
+
+                if (qSettingsValue(settings, "mode") == "thumbnails"):
                     file_pane.switchView()
 
                 count = settings.beginReadArray("history")
                 for j in xrange(count):
                     logger.info("Restoring tab %s pane %s history %s", tab_name, i, j)
                     settings.setArrayIndex(j)
-                    file_pane.dir_history.append(settings.value("dirpath"))
+                    file_pane.dir_history.append(qSettingsValue(settings, "dirpath"))
                 settings.endArray()
                 
-                file_pane.current_dir_history = int(settings.value("current_history", 0))
+                file_pane.current_dir_history = qSettingsValue(settings, "current_history", 0)
                 file_dirs_panes.append((file_dir, file_pane))
 
             settings.endArray()
 
-            i = int(settings.value("current_tab", 0))
+            i = qSettingsValue(settings, "current_tab", 0)
             tab.setCurrentIndex(i)
 
             settings.endGroup()
@@ -7670,15 +8034,15 @@ class TwinWindow(QMainWindow):
         count = settings.beginReadArray("devices")
         for i in xrange(count):
             settings.setArrayIndex(i)
-            device = settings.value("json")
+            device = qSettingsValue(settings, "json")
             device = json.loads(device)
             g_localsend_devices.append(LocalsendDevice(**device))
         settings.endArray()
-        myinfo = settings.value("myinfo", None)
+        myinfo = qSettingsValue(settings, "myinfo", None)
         if (myinfo is not None):
             g_localsend_myinfo = json.loads(myinfo)
         settings.endGroup()
-        
+
         if ((len(self.left_panes) == 0) and (left_file_dir is None)):
             left_file_dir = os.getcwd()
 
@@ -7706,11 +8070,18 @@ class TwinWindow(QMainWindow):
         # directory dialog boxes show on top of the app window and not out of
         # nowhere
         for file_dir, file_pane in file_dirs_panes:
-            if (file_dir.startswith("search:")):
-                # XXX Set this in setSearchString
-                file_pane.search_mode = True
-                file_pane.old_file_dir = os.getcwd()
-                file_pane.setSearchString(file_dir[len("search:"):])
+            # FilePane.setDirectory disables search and filtering, call the
+            # specific methods for search and filtering
+            
+            # XXX Set this in setFilterString/setSearchString
+            file_pane.search_mode = file_dir.startswith("search:")
+            file_dir = file_dir[len("search:"):] if (file_pane.search_mode) else file_dir
+
+            if (file_pane.filter_string != ""):
+                file_pane.setFilterString(file_dir, file_pane.search_mode, file_pane.filter_string, file_pane.filter_is_regexp, file_pane.model.filter_recurse, file_pane.model.filter_ignore_case)
+
+            elif (file_pane.search_mode):
+                file_pane.setSearchString(file_dir)
 
             else:
                 file_pane.setDirectory(file_dir, False)
@@ -7723,7 +8094,23 @@ class TwinWindow(QMainWindow):
         logger.info("App font %s pointSize %d height %d", qApp.font().family(), qApp.font().pointSize(), qApp.fontMetrics().height())
 
     def updateWindowTitle(self):
-        self.setWindowTitle("Twin - %s" % self.getActivePane().file_dir)
+        active_pane = self.getActivePane()
+        logger.info("%s", "left" if (active_pane is self.getLeftPane()) else ("right" if (active_pane is self.getRightPane()) else "None"))
+        
+        # XXX There's a QTabWidget bug for which when switching to another tab
+        #     of the left tab widget, the focus briefly goes to the right tab
+        #     widget and then to the proper tab of the left tab widget. This
+        #     stays around 200ms in the wrong tab widget, delay the update so
+        #     there's no title flash?
+        
+        # XXX Investigate what QTabWidget.currentChanged reports, but note
+        #     hooking on that one one is not enough, since still need to hook on
+        #     focusIn to change the title when clicking on the other QTabWidget,
+        #     etc
+
+        # active_pane can be None at startup
+        if (active_pane is not None):
+            self.setWindowTitle("Twin - %s" % active_pane.file_dir)
         
     def setupActions(self):
         
@@ -7750,6 +8137,7 @@ class TwinWindow(QMainWindow):
 
         # XXX LineEdit with directory name, bookmarks/favorites/history combobox
         # XXX Allow filtering files by typing name
+        # XXX Add reopen "last closed tab"
         
         self.addAction(self.nextPaneAct)
         self.addAction(self.chooseBookmarkAct)
@@ -7770,7 +8158,6 @@ class TwinWindow(QMainWindow):
         source_pane = self.getRightPane() if reverse else self.getLeftPane()
         target_pane = self.getLeftPane() if reverse else self.getRightPane()
 
-        
         # - if the cursor is on the target pane, use the source pane's dirpath/search string
         # - If the cursor is on the source pane and over a non  ".." directory,
         #   use that directory as dirpath
@@ -7779,7 +8166,10 @@ class TwinWindow(QMainWindow):
         search_mode = source_pane.search_mode
         if (source_pane is self.getActivePane()):
             file_info = source_pane.getActiveView().currentIndex().data(Qt.UserRole)
-            if (source_pane.isBrowsable(file_info) and (file_info.filename != "..")):
+            # Pane may be empty if still populating (eg slow listings), use
+            # existing dirpath in that case
+            if ((file_info is not None) and 
+                source_pane.isBrowsable(file_info) and (file_info.filename != "..")):
                 dirpath = os.path.join(dirpath, file_info.filename)
                 search_mode = False
             
@@ -8044,11 +8434,23 @@ class TwinWindow(QMainWindow):
         return self.right_panes[self.right_tab.currentIndex()]
 
     def getSourcePane(self):
+        # This can return None at startup, at other times this can
+        # briefly return the "right" pane instead of the "left" pane when
+        # tabbing on the left pane. This seems to be a QTabWidget bug where
+        # it briefly loses focus when switching tabs of the same QTabWidget.
+        # ~200ms later the left FocusIn message comes in and this returns the 
+        # proper left pane. The symptom is that the window title briefly flashes
+        # the wrong text, see updateWindowTitle
         if (self.focusWidget() is self.getLeftPane().getActiveView()):
             return self.getLeftPane()
-        else:
+
+        elif (self.focusWidget() is self.getRightPane().getActiveView()):
             return self.getRightPane()
 
+        else:
+            logger.info("None focusWidget")
+            return None
+        
     def getTargetPane(self):
         if (self.getSourcePane() is self.getRightPane()):
             return self.getLeftPane()
@@ -8068,10 +8470,20 @@ class TwinWindow(QMainWindow):
     def createPane(self, tab, display_width=DISPLAY_WIDTH, sort_column=1, sort_order=Qt.AscendingOrder):
         logger.info("")
 
-        def updateTabTitle(tab, file_pane, text):
-            logger.info("%r, %r, %r", tab, file_pane, text)
+        def updateTabTitle(file_pane, text):
+            logger.info("%r, %r", file_pane, text)
+            
             if (text.startswith("search:")):
-                text = "s:" + text[len("search:"):]
+                text = text[len("search:"):]
+
+            elif (file_pane.filter_string != ""):
+                # XXX Use filter: as protocol? but it needs the base directory,
+                #     regexp vs. not, ignore case, etc
+                
+                # XXX Without a filter: protocol there's no way to easily
+                #     bookmark? But what if want to combine protocols like
+                #     search: and filter:
+                text = file_pane.filter_string
 
             else:
                 basename = os.path.basename(text)
@@ -8079,16 +8491,101 @@ class TwinWindow(QMainWindow):
                 # show the incoming text
                 text = basename if (basename != "") else (text if (text != "") else os.sep)
             
+            # Use the runtime parent instead of the current value of "tab" since
+            # FilePanel can be reparented at runtime when swapPanes is used.
+            # Same goes for index, since previous siblings can be deleted, or
+            # reparenting itself change the index.
+            tab = qTabWidgetFromPage(file_pane)
             index = tab.indexOf(file_pane)
             
             tab.setTabText(index, text)
 
-            # XXX Rotate the icon on a timer, but it needs to know when not to
-            #     start the timer if already started, have a generic animation
-            #     timer that can be connected to for multiple animations?
-            loading = False if (file_pane.model.directoryReader is None) else file_pane.model.directoryReader.isRunning()
-            icon = qApp.style().standardIcon(QStyle.SP_BrowserReload) if loading else QIcon()
-            tab.setTabIcon(index, icon)
+            # There can be multiple icons that apply (eg filtering a packed
+            # directory), check in priority order
+            
+            # XXX Think of a way of combining icons?
+
+            # XXX Icons take space in the tabbar, have a setting to disable
+            #     "static" icons, only use eg loading maybe filtering?
+            loading = ((file_pane.model.directoryReader is not None) and file_pane.model.directoryReader.isRunning())
+            if (loading):
+                icon = qApp.style().standardIcon(QStyle.SP_BrowserReload)
+
+                # XXX Have a setting to disable animation?
+                # loading_animation_timer will be None when the panel is winding
+                # down, don't restart the timer in that case
+                if (file_pane.loading_animation_timer is None):
+                    def rotate_tab_icon(file_pane):
+                        logger.info("")
+                        # Both index and tab are volatile:
+                        # - sibling panes can be deleted shifting this index
+                        # - the pane can even be reparented to any index in the 
+                        #   other tab widget
+                        # so get the current tab and index 
+                        tab = qTabWidgetFromPage(file_pane)
+                        index = tab.indexOf(file_pane)
+
+                        angle = file_pane.loading_animation_angle
+                        icon = qApp.style().standardIcon(QStyle.SP_BrowserReload)
+
+                        # Note (as per docs) the created pixmap may be smaller
+                        # than the requested size, eg Windows 10 returns 32x32
+                        # when requesting 64x64
+                        
+                        # XXX The tab height grows when using an icon wrt not
+                        #     using it, but it doesn't look like changing the
+                        #     icon size chnages the height?
+                        pix = icon.pixmap(32, 32)
+                        w, h = pix.width(), pix.height()
+                        pix = pix.transformed(QTransform().rotate(angle), Qt.SmoothTransformation)
+
+                        # Using other than 90 degree increments causes a
+                        # pulsating grow/shrink effect: the rotation increases
+                        # the image bounds, which then when used as an icon are
+                        # reduced to the icon size, effectively scaling down the
+                        # image. Crop the image to the original size, centered
+                        # on the center
+                        x = (pix.width() - w) // 2
+                        y = (pix.height() - h) // 2
+                        pix = pix.copy(QRect(x, y, w, h))
+                        
+                        tab.setTabIcon(index, QIcon(pix))
+
+                        file_pane.loading_animation_angle = (angle + 30) % 360
+                        file_pane.loading_animation_timer.start(250)
+
+                    file_pane.loading_animation_timer = QTimer()
+                    file_pane.loading_animation_timer.setSingleShot(True)
+                    file_pane.loading_animation_timer.timeout.connect(lambda : rotate_tab_icon(file_pane))
+
+                    rotate_tab_icon(file_pane)
+            
+            elif (file_pane.model.filter_string != ""):
+                icon = qApp.style().standardIcon(QStyle.SP_FileDialogContentsView) 
+
+            elif (file_pane.search_mode):
+                icon = qGetSystemIcon(".efu")
+            
+            elif (os_path_contains(SHARE_ROOT, file_pane.file_dir)):
+                icon = qApp.style().standardIcon(QStyle.SP_ComputerIcon)
+
+            elif (file_pane.model.needsExtracting()):
+                # XXX This will trap any plugin, fix?
+                icon = qGetSystemIcon(".zip")
+            
+            else:
+                # Setting a null icon disables the icon
+                # XXX Use also a regular folder for local listings?
+                icon = QIcon()
+            
+            if (not loading):
+                tab.setTabIcon(index, icon)
+
+                if (file_pane.loading_animation_timer is not None):
+                    file_pane.loading_animation_timer.stop()
+                    file_pane.loading_animation_timer.disconnect()
+                    file_pane.loading_animation_angle = 0
+                    file_pane.loading_animation_timer = None
             
             # Use full directory as tooltip
             if (not file_pane.search_mode):
@@ -8105,10 +8602,10 @@ class TwinWindow(QMainWindow):
         # Tab title will be set when calling setDirectory
         tab.addTab(file_pane, "")
 
-        # Use the runtime parent instead of the current value of "tab" since
-        # FilePanel can be reparented at runtime when swapPanes is used. Note
-        # the hierarchy is FilePane->QStackWidget-> QTabWidget
-        file_pane.directoryLabelChanged.connect(lambda a: updateTabTitle(file_pane.parent().parent(), file_pane, a))
+        file_pane.directoryLabelChanged.connect(lambda a: updateTabTitle(file_pane, a))
+
+        qRestoreActionShortcuts(self.settings, file_pane)
+        qRestoreActionShortcuts(self.settings, file_pane.table_view)
 
         return file_pane
 
@@ -8137,6 +8634,8 @@ class TwinWindow(QMainWindow):
             action.setCheckable(i == tab.currentIndex())
             action.setChecked(i == tab.currentIndex())
 
+        # XXX Have a setting to append favorites to the tab options, big UX win
+        # XXX Allow giving names to tabs with space?
         action = menu.exec_(tab.tabBar().mapToGlobal(tab.tabBar().rect().bottomLeft()))
         tab_index_set = set([a.data() for a in menu.actions() if a.data() is not None])
 
@@ -8187,12 +8686,32 @@ class TwinWindow(QMainWindow):
             logger.info("Not deleting last pane")
             return
 
-        must_refocus = (self.getActivePane() is file_panes[index])
+        file_pane = file_panes[index]
+        must_refocus = file_pane in [self.getLeftPane(), self.getRightPane()]
         tab.removeTab(index)
+
+        # Do panel cleanup 
+        # XXX Move to panel method?
+
+        # Abort directoryReader (no need to check it's running), otherwise the
+        # emitter keeps emitting and crashes
+        logger.info("Aborting directoryReader")
+        file_pane.model.directoryReader.abort()
+
+        # XXX Do this in FilePane.__del__? But it's not clear __del__ will be
+        #     called if the timer is keeping a reference to the FilePane?
+        # Don't .disconnect() if no connections, fails with "disconnect() of all signals failed"
+        if (file_pane.loading_animation_timer is not None):
+            logger.info("Stopping and disconnecting animation timer")
+            file_pane.loading_animation_timer.stop()
+            file_pane.loading_animation_timer.disconnect()
+            file_pane.loading_animation_timer = None
+
         del file_panes[index]
 
         if (must_refocus):
             i = tab.currentIndex()
+            logger.info("Refocusing from %d to %d", index, i)
             file_panes[i].getActiveView().setFocus()
 
     def closeTab(self):
@@ -8316,6 +8835,10 @@ class TwinWindow(QMainWindow):
                 settings.setValue("display_width", file_pane.display_width)
                 settings.setValue("sort_column", file_pane.model.sort_column)
                 settings.setValue("sort_order", file_pane.model.sort_order)
+                settings.setValue("filter_string", file_pane.filter_string)
+                settings.setValue("filter_recurse", file_pane.model.filter_recurse)
+                settings.setValue("filter_is_regexp", file_pane.filter_is_regexp)
+                settings.setValue("filter_ignore_case", file_pane.model.filter_ignore_case)
                 
                 settings.beginWriteArray("history")
                 for j, dirpath in enumerate(file_pane.dir_history):
@@ -8331,6 +8854,7 @@ class TwinWindow(QMainWindow):
         for i, bookmark in enumerate(self.bookmarks):
             settings.setArrayIndex(i)
             settings.setValue("dirpath", bookmark)
+            # XXX Currently bookmarks don't store the filter state, add?
         settings.endArray()
 
         settings.beginGroup("localsend")
@@ -8345,6 +8869,10 @@ class TwinWindow(QMainWindow):
         #     consistency or viceversa?
         settings.setValue("myinfo", json.dumps(g_localsend_myinfo))
         settings.endGroup()
+
+        qSaveActionShortcuts(settings, self)
+        qSaveActionShortcuts(settings, self.left_panes[0])
+        qSaveActionShortcuts(settings, self.left_panes[0].table_view)
 
         return super(TwinWindow, self).closeEvent(event)
 
@@ -8388,9 +8916,20 @@ if (do_parse_test):
 
 
 def main():
+    # Let Windows 10 know this is a DPI aware app, reduces blur
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+    except:
+        logger.warn("Unable to set DPI awareness flag")
+
     restore_python_exceptions()
 
     app = QApplication(sys.argv)
+
+    # Reduce the app font size
+    font = app.font()
+    font.setPointSize(max(1, font.pointSize() - 1))
+    app.setFont(font)
 
     file_dirs = [None, None]
     if (len(sys.argv) > 1):

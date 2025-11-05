@@ -32,7 +32,7 @@ PyQt5 twin panel file manager playground, but functional
 - Incremental/Background/Cancellable directory listing
 - Optimized directory listing on win32 using ctypes
 - Table and thumbnail views
-- PIL supported file formats for thumbnails, EXIF rotationc
+- PIL supported file formats for thumbnails, EXIF rotation
 - Automatically sizable/show/hide columns
 - Resizable thumbnails
 - Cached & background loaded thumbnails
@@ -59,11 +59,12 @@ PyQt5 twin panel file manager playground, but functional
 - Config file
 - Sorting by column
 - Directory background loading indicator on tab
+- Panel file filtering/finding
+- Configurable keyboard shortcuts in config file
 
 ## TODO
 
 - Use multiprocessing instead of multithreading to avoid GIL UI blocking
-- Keyboard file filtering
 - Copy/move error overwrite reporting
 - Report copy/move progress
 - Background copy, move 
@@ -71,6 +72,8 @@ PyQt5 twin panel file manager playground, but functional
 - Full compressed archive / WCX packer support (create, read, update, delete)
 - Drag & Drop
 - Menus, About
+- single http/ftp file download
+- list links in html page
 
 ## Requirements
 

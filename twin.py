@@ -138,9 +138,11 @@ Needs filter events to:
 
 import __builtin__
 import collections
+import csv
 import ctypes
 import datetime
 import errno
+import fnmatch
 import json
 import logging
 import os
@@ -150,6 +152,7 @@ import re
 import shutil
 import stat
 import string
+import StringIO
 import struct
 import sys
 import time
@@ -231,21 +234,29 @@ def fileinfo_cmp(a, b, field=0, reverse=False):
 
     assert field < len(a), "wrong field index %d" % field
 
-    if (a == ".."):
-        if (b == ".."):
+    if (a.filename == ".."):
+        if (b.filename == ".."):
             res = 0
         else:
             res = -1
     
-    elif (b == ".."):
+    elif (b.filename == ".."):
         res = 1
 
     elif (a_is_dir == b_is_dir):
         # Always compare dirs by name
+        # XXX Have a setting for sorting dirs on top/intertwined?
         if ((field == 0) or a_is_dir):
             res = cmp(a.filename.lower(), b.filename.lower())
         else:
             res = cmp(a[field], b[field])
+
+        # Always sort by name second if equal for the current order,
+        # mergeDirEntries requires not returning equal if fileinfos are
+        # different (ie different filename) or it will fail to detect
+        # insertions/deletions
+        if ((field != 0) and (res == 0)):
+            res = cmp(a.filename.lower(), b.filename.lower())
 
         # Don't reverse directory ordering, only files
         res = -res if (reverse and not a_is_dir) else res
@@ -340,6 +351,51 @@ def os_path_physpath(path):
             break
 
     return path
+
+def os_path_dirname(path):
+    """
+    os.path.dirname won't go up server shares to the server name, special case
+    server shares to return the server name, fallback to os.path.dirname
+    otherwise
+    """
+    if (path.startswith("\\\\")):
+        unc, rest = os.path.splitunc(path)
+        rest = rest[:-1] if rest.endswith("\\") else rest
+        # for \\server, unc is "" and rest is the server
+        # for \\server\share\dir1\dir2\file unc is \\server\share or empty, rest is \dir1\dir2\file
+        if (unc == ""):
+            dirpath = path
+        
+        elif (rest == ""):
+            # Return \\server
+            dirpath = unc[:unc.rindex("\\")]
+
+        else:
+            dirpath = os.path.dirname(path)
+            # XXX Remove trailing slashes, necessary because the call site in
+            #     itemActivated used to normpath(path, "..") before calling into
+            #     os.path.dirname, which also removes trailing slashes.
+            #     Rationalize the whole code regarding trailng slashes in
+            #     directories
+            dirpath = dirpath[:-1] if dirpath.endswith("\\") else dirpath
+
+    else:
+        dirpath = os.path.dirname(path)
+
+    return dirpath
+
+def os_path_basename(path):
+    """
+    os.path.basename won't return the share of \\server\share special case
+    server shares to return the share name, fallback to os.path.dirname
+    otherwise
+    """
+    dirname = os_path_dirname(path)
+    i = len(dirname)
+    # remove trailing slash that dirname may return
+    basename = path[i:] if dirname.endswith("\\") else path[i+1:]
+    
+    return basename
 
 def os_path_root(path):
     """
@@ -1352,7 +1408,7 @@ def win32_filetime_to_timestamp(filetime):
 #     #define constants, and -1 cannot be used because it note this cannot be
 #     expressed via aneeds to be a positive number since comparing against -1
 #     doesn't work for c_void_p)
-WIN32_INVALID_HANDLE_VALUE = 2**64-1
+WIN32_INVALID_HANDLE_VALUE = 2**32-1 if platform_is_32bit() else 2**64-1 
 def win32_get_last_error():
     """
     Log and return the code and message for the WIN32 API GetLastError
@@ -1382,6 +1438,80 @@ def win32_get_last_error():
     logger.info("%d: %r", error_code, buffer.value)
 
     return error_code, buffer.value
+
+def win32_get_disk_shares(server):
+    """
+    Get the SMB disk share names from server
+    """
+    logger.info("%r", server)
+
+    from ctypes import wintypes
+
+    # Constants from lmshare.h
+    NERR_Success = 0
+    MAX_PREFERRED_LENGTH = -1
+    STYPE_DISKTREE = 0
+    STYPE_MASK = 0xFFFF
+
+    # Define SHARE_INFO_1 structure
+    class SHARE_INFO_1(ctypes.Structure):
+        _fields_ = [
+            ("shi1_netname", wintypes.LPWSTR),
+            ("shi1_type", wintypes.DWORD),
+            ("shi1_remark", wintypes.LPWSTR),
+        ]
+
+    # Load Netapi32.dll
+    netapi32 = ctypes.WinDLL('Netapi32', use_last_error=True)
+
+    NetShareEnum = netapi32.NetShareEnum
+    NetShareEnum.argtypes = [
+        wintypes.LPWSTR,     # servername
+        wintypes.DWORD,      # level
+        ctypes.POINTER(ctypes.c_void_p),  # bufptr
+        wintypes.DWORD,      # prefmaxlen
+        ctypes.POINTER(wintypes.DWORD),   # entriesread
+        ctypes.POINTER(wintypes.DWORD),   # totalentries
+        ctypes.POINTER(wintypes.DWORD)    # resume_handle
+    ]
+    NetShareEnum.restype = wintypes.DWORD
+
+    NetApiBufferFree = netapi32.NetApiBufferFree
+    NetApiBufferFree.argtypes = [ctypes.c_void_p]
+    NetApiBufferFree.restype = wintypes.DWORD
+
+    level = 1
+    bufptr = ctypes.c_void_p()
+    entriesread = wintypes.DWORD(0)
+    totalentries = wintypes.DWORD(0)
+    resume_handle = wintypes.DWORD(0)
+
+    shares = []
+
+    logger.info("Calling NetShareEnum")
+    status = NetShareEnum(server, level, ctypes.byref(bufptr), MAX_PREFERRED_LENGTH,
+                        ctypes.byref(entriesread), ctypes.byref(totalentries),
+                        ctypes.byref(resume_handle))
+    logger.info("Called NetShareEnum returned %d", status)
+    
+    # XXX Missing handling ERROR_MORE_DATA
+    if (status == NERR_Success):
+        array_type = SHARE_INFO_1 * entriesread.value
+        share_array = ctypes.cast(bufptr, ctypes.POINTER(array_type)).contents
+        for share in share_array:
+            logger.info("Found share %s type 0x%x", share.shi1_netname, share.shi1_type)
+            if ((share.shi1_type & STYPE_MASK) == STYPE_DISKTREE):
+                # Note print$ is not the print queue, it's actually a disk share
+                # containing the printer drivers
+                shares.append(share.shi1_netname)
+    else:
+        raise ctypes.WinError(ctypes.get_last_error())
+
+    if bufptr:
+        NetApiBufferFree(bufptr)
+
+    return shares
+
 
 # Constants for LocalSend protocol
 LOCALSEND_MULTICAST_GROUP = '224.0.0.167'
@@ -1702,14 +1832,31 @@ def localsend_upload_to_device(myinfo, device, filepath):
 # - Added filtering, search tab icon, shortcuts in config, rotating loading icon
 # - Fixed DirectoryReader loop, dir_infos_set initialization, search tooltip 
 #   after toggling search
-APPLICATION_VERSION = "0.2.0"
+# 0.3.0 
+# - Added about
+# - Added application icon, taskbar entry, version window title, smaller tab icons
+# - Added external_xxxx_params 
+# - Added Windows share listing
+# - Added open in external editor
+# - Added open command line
+# - Added selectFiles dialog box and shortcuts
+# - Changed non-regexp filters to fnmatch
+# - Fixed search not resetting filter
+# - Fixed fileinfo_cmp
+APPLICATION_VERSION = "0.3.0"
+
 # 0.0.1 Added config file
 # 0.1.0 Added sorting settings
 # 0.2.0 Added filter, shortcut settings
-CONFIG_FILE_VERSION = "0.2.0"
+# 0.3.0 Added select/deselect shortcuts, external_xxx_params and 
+#       external_editor_xxx, external_cmd_xxx
+CONFIG_FILE_VERSION = "0.3.0"
 
 INCLUDE_DIR = "include"
-TEMP_DIR = os.path.join("_out", "temp")
+# XXX Get this from config file
+OUT_DIR = "_out"
+# XXX Get this from config file
+TEMP_DIR = os.path.join(OUT_DIR, "temp")
 
 # XXX This needs to use the imagereader/PIL supported extensions
 IMAGE_EXTENSIONS = ('.bmp','.enc','.gif', '.jpg', '.jpeg', '.jfif', '.png', '.webp')
@@ -1730,9 +1877,18 @@ PACKER_7ZIP_EXTENSIONS_UNPACK_ONLY = (".apfs", ".ar", ".arg", ".cab", ".chm",
 TOTAL7ZIP_EXTENSIONS = PACKER_7ZIP_EXTENSIONS + PACKER_7ZIP_EXTENSIONS_UNPACK_ONLY
 PACKER_EXTENSIONS = (".iso",".bz2")  + TOTAL7ZIP_EXTENSIONS
 
-EXTERNAL_VIEWER_FILEPATH = R"C:\Program Files\totalcmd\TOTALCMD%s.EXE" % ("" if platform_is_32bit() else "64")
-
-EXTERNAL_DIFF_FILEPATH = R"C:\Program Files\KDiff3\kdiff3.exe"
+EXTERNAL_VIEWER_FILEPATH = R"%%ProgramFiles%%\totalcmd\TOTALCMD%s.EXE" % ("" if platform_is_32bit() else "64")
+EXTERNAL_VIEWER_PARAMS = ["/S=L"]
+# Note vscode 1.64.0 will silently fail to open a file this way if it's in a
+# python debugging session
+EXTERNAL_EDITOR_FILEPATH = "notepad.exe" if platform_is_32bit() else R"%LOCALAPPDATA%\Programs\Microsoft VS Code\Code.exe"
+EXTERNAL_EDITOR_PARAMS = []
+EXTERNAL_DIFF_FILEPATH = R"%ProgramFiles%\KDiff3\kdiff3.exe"
+EXTERNAL_DIFF_PARAMS = []
+# - cmd.exe /S /K for opening in a new window, use quote escaping
+# - cd /d to change directory and drive
+EXTERNAL_CMD_FILEPATH = "cmd.exe"
+EXTERNAL_CMD_PARAMS = ["/S", "/K", "cd", "/d", "%0","&", "title", "%3"]
 
 # Size of the thumbnails stored in the model
 IMAGE_WIDTH = 256
@@ -1820,10 +1976,16 @@ do_parse_test = False
 g_localsend_devices = []
 g_localsend_myinfo = None
 
-# These are read initialized to the constants and later read from the config
-# file
-g_external_viewer_filepath = EXTERNAL_VIEWER_FILEPATH
-g_external_diff_filepath = EXTERNAL_DIFF_FILEPATH
+# These are initialized to the constants and later read from the config file
+# XXX Do expandvars when reading from config file?
+g_external_viewer_filepath = os.path.expandvars(EXTERNAL_VIEWER_FILEPATH)
+g_external_viewer_params = EXTERNAL_VIEWER_PARAMS
+g_external_editor_filepath = os.path.expandvars(EXTERNAL_EDITOR_FILEPATH)
+g_external_editor_params = EXTERNAL_EDITOR_PARAMS
+g_external_diff_filepath = os.path.expandvars(EXTERNAL_DIFF_FILEPATH)
+g_external_diff_params = EXTERNAL_DIFF_PARAMS
+g_external_cmd_filepath = os.path.expandvars(EXTERNAL_CMD_FILEPATH)
+g_external_cmd_params = EXTERNAL_CMD_PARAMS
 
 def qFindMainWindow():
     for widget in qApp.topLevelWidgets():
@@ -1851,22 +2013,91 @@ def qInsertDialogWidget(dialog, widget, index):
     dialog.setTabOrder(layout.itemAt(i-1).widget(), layout.itemAt(i).widget())
     dialog.setTabOrder(layout.itemAt(i).widget(), layout.itemAt(i+1).widget())
 
-def qSettingsValue(settings, key, default=None):
+def encode_string_list(l):
+    """
+    Encodes a list of strings into a single human readable string. The
+    individual strings are comma separated in the final string. Existing commas
+    are encoded as per csv conventions, ie quotation marks
+
+    This is used to store lists of strings in ini files in a way that can be
+    easily edited by hand (QSettings already supports lists of strings, but does
+    binary encoding which makes hand editing hard)
+
+    Eg ["/S", "%3,"] becomes '/S,"%3,"' and, in an ini file that double quotes
+    strings containing commas results in "/S,\"%3,\""
+
+    csv will only add quotation marks if commas are inside the individual
+    strings
+    """
+    f = StringIO.StringIO()
+    csv.writer(f).writerow(l)
+    
+    # csv will encode empty lists as \r\n, strip for better human readability
+    return f.getvalue().strip()
+
+def decode_string_list(s):
+    """
+    Take a string encoded using encode_string_list and convert it back to the
+    original list of strings.
+    """
+    # csv will raise StopIteration at empty strings, which encode_string_list
+    # returns for empty lists, special case
+    if (s == ""):
+        l = []
+    else:
+        f = StringIO.StringIO(s)
+        l = next(csv.reader(f))
+    
+    return l
+
+def test_encode_string_list():
+    for l in [ 
+        [], ["a"], ["a,"], ["a,","b"], ["a",",b"], ["a,",",b"]
+    ]:
+        print "Testing %r" % l
+        print "escaped %r" % encode_string_list(l)
+        print "unescaped %r" % decode_string_list(encode_string_list(l))
+        assert decode_string_list(encode_string_list(l)) == l
+        print
+    
+def qSettingsValue(settings, key, default=None, notype=False):
     """
     Settings store strings and settings.value type= parameter can be used to
     cast, simplify by using use the default value type to return the right value
     """
-    if (default is None):
-        return settings.value(key, default)
+    if ((default is None) or notype):
+        value = settings.value(key, default)
 
     else:
-        return settings.value(key, default, type=type(default))
+        if (isinstance(default, (list, tuple))):
+            value = settings.value(key)
+            if (value is None):
+                value = default
 
-def qSaveActionShortcuts(settings, widget, group="shortcuts"):
-    """Save all QAction shortcuts from the given widget into QSettings."""
-    logger.info("group %s", group)
-    settings.beginGroup(group)
-    # Save only direct children actions, this prevents finding actions from
+            else:
+                # Encode and decode string lists as strings in settings files:
+                # - QSettings in .ini files doesn't allow commas inside unquoted
+                #   strings, they have to be inside quotation marks. 
+                # - This only matters if the .ini file is edited by hand, since
+                #   setValue adds quotation marks when needed. 
+                # - If commas are added manually to an unquoted string,
+                #   QSettings will read as a list instead of as string, which
+                #   would be convenient but unfortunately there's no way to
+                #   write unquoted commas programmatically without the list
+                #   going through binary encoding as well, which is undesirable
+                #   because prevents hand editing.
+                value = decode_string_list(value)
+
+        else:
+            value = settings.value(key, default, type=type(default))
+    return value
+
+def qGetActionShortcuts(widget):
+    """
+    Return list of pairs of (action name, list of action shortcuts))
+    """
+    shortcuts = []
+    # Find only direct children actions, this prevents finding actions from
     # stale popup menus
     # XXX Investigate why there are stale EditablePopupMenus
     for action in widget.findChildren(QAction, options=Qt.FindDirectChildrenOnly):
@@ -1874,13 +2105,22 @@ def qSaveActionShortcuts(settings, widget, group="shortcuts"):
         #     the text for now
         name = action.objectName() or action.text()
         if (name != ""):
+            shortcuts.append((name, [shortcut.toString() for shortcut in action.shortcuts()]))
+
+    return shortcuts
+    
+def qSaveActionShortcuts(settings, widget, group="shortcuts"):
+    """Save all QAction shortcuts from the given widget into QSettings."""
+    logger.info("group %s", group)
+    settings.beginGroup(group)
+    for name, shortcuts in qGetActionShortcuts(widget): 
+        if (name != ""):
             # Forward slashes in keys are regarded as hierarchy, escape them
             name = name.replace("/", "^")
-            shortcuts = string.join([shortcut.toString() for shortcut in action.shortcuts()], " ")
             logger.info("saving action %r shortcuts %r", name, shortcuts)
-            # Store as space-separated list, no need to escape since spaces are
-            # encoded as "Space" for shortcuts
-            settings.setValue(name, shortcuts)
+            # Store as space-separated list, no need to escape since spaces
+            # don't appear in shortcuts, they are already encoded as "Space"
+            settings.setValue(name, string.join(shortcuts, " "))
     settings.endGroup()
 
 def qRestoreActionShortcuts(settings, widget, group="shortcuts"):
@@ -1903,7 +2143,7 @@ def qRestoreActionShortcuts(settings, widget, group="shortcuts"):
 def qTabWidgetFromPage(pageWidget):
     """Given a widget inside a QTabWidget, return the QTabWidget"""
     logger.info("")
-    # Note the hierarchy is FilePane->QStackWidget-> QTabWidget
+    # Note the hierarchy is FilePane->QStackWidget->QTabWidget
     tab = pageWidget.parent().parent()
     assert issubclass(type(tab), QTabWidget)
 
@@ -2291,10 +2531,10 @@ class EverythingFileInfoIterator(FileInfoIterator):
         # On XP 32-bit there's a warning when WinDLL cannot load a DLL, don't
         # load 64 bit and fallback to 32, check 32 bit explicitly
         if (platform_is_32bit()):
-            everything_dll = ctypes.WinDLL(R"_out\Everything32.dll")
+            everything_dll = ctypes.WinDLL(os.path.join(OUT_DIR, "Everything32.dll"))
 
         else:
-            everything_dll = ctypes.WinDLL(R"_out\Everything64.dll")
+            everything_dll = ctypes.WinDLL(os.path.join(OUT_DIR, "Everything64.dll"))
             
         self.everything_dll = everything_dll
 
@@ -2523,10 +2763,10 @@ class Win32FileInfoIterator(FileInfoIterator):
                     break
                 # Start the search
                 dirpath = dirpath_stack.pop()
-                # Add wildcard, required by FindFirstFile
-                abs_dirpath = os.path.join(self.dirpath, dirpath, "*")
+                abs_dirpath = os.path.join(self.dirpath, dirpath)
                 assert None is logger.debug("Reading first entry for %r %r %r", dirpath, self.dirpath, abs_dirpath)
-                handle = c.FindFirstFileW(abs_dirpath, ctypes.byref(find_data))
+                # Add wildcard, required by FindFirstFile
+                handle = c.FindFirstFileW(os.path.join(abs_dirpath, "*"), ctypes.byref(find_data))
                 
                 if (handle == WIN32_INVALID_HANDLE_VALUE):
                     logger.warn("Unable to open directory or invalid path %r %r %r" % (dirpath, self.dirpath, abs_dirpath))
@@ -2547,6 +2787,8 @@ class Win32FileInfoIterator(FileInfoIterator):
             if (filename == "."):
                 continue
 
+            # Findfirst returns ".." on roots of network shares, createIterator
+            # takes care of rerouting that one to a Win32ShareFileInfoIterator
             is_dotdot = (filename == "..")
             filename = os.path.join(dirpath, filename)
             
@@ -2773,7 +3015,7 @@ class WFXFileInfoIterator(FileInfoIterator):
                     default_params.PluginInterfaceVersionHigh = 2
                     # sftp ignores the ini name and only uses the directory,
                     # where it stores sftpplug.ini, similarly davplug
-                    default_params.DefaultIniName = R"_out\twin.ini"
+                    default_params.DefaultIniName = os.path.join(OUT_DIR, "twin.ini")
 
                     c.FsSetDefaultParams(default_params)
 
@@ -2801,7 +3043,7 @@ class WFXFileInfoIterator(FileInfoIterator):
                             return 0
 
                         startup_info = c.tExtensionStartupInfo()
-                        startup_info.PluginConfDir = "_out\\"
+                        startup_info.PluginConfDir = OUT_DIR + "\\"
                         
                         msgbox_proc = c.tMessageBoxProc(message_box)
                         startup_info.MessageBox = msgbox_proc
@@ -3477,6 +3719,12 @@ class ZipFileInfoIterator(FileInfoIterator):
         if (self.zip is None):
             # XXX Split the path into path to the zip file and path inside the
             #     zip file
+            # XXX This locks the file and other processes cannot write to it,
+            #     open and close on demand? Open passing the file object?
+            #     This seems to a python open() issue on Windows where it uses
+            #     default sharing attributes, the solution is to
+            #       fh = os.open('data.txt', os.O_RDONLY | os.O_SHARE_WRITE)
+            #       f = os.fdopen(fh, 'r')
             self.zip = zipfile.ZipFile(self.arcpath)
             self.current_file = 0
             logger.info("filelisting")
@@ -3573,10 +3821,12 @@ class ZipFileInfoIterator(FileInfoIterator):
         file_infos = list(dir_infos_set) + file_infos 
         
         self.done = (len(file_infos) == 0)
-        
+
         return dir_infos_set, file_infos
 
     def extract(self, filepath):
+        logger.info("%r", filepath)
+
         relpath = filepath[len(self.arcpath)+1:]
         # Entries in the zip file use forward slashes with no starting
         # forward slash
@@ -3716,6 +3966,43 @@ class CsvFileInfoIterator(FileInfoIterator):
     def isDone(self):
         return self.done
 
+class Win32SharesFileInfoIterator(FileInfoIterator):
+    def __init__(self, server, *args, **kwargs):
+        """
+        """
+        logger.info("server %s", server)
+        
+        self.server = server
+        self.done = False
+        
+    def getFileInfos(self, batch_size=0):
+        logger.info("")
+
+        server = self.server
+
+        dir_infos_set = set()
+        file_infos = []
+
+        if (not self.done):
+            # XXX Reimplement this using CTypesHelper?
+            shares = win32_get_disk_shares(server)
+            file_infos = [
+                FileInfo(
+                    filename=name, 
+                    size=0, 
+                    mtime=1624206883116, 
+                    attr=fileinfo_build_attr(True, name.endswith("$"), False, True)
+                ) for name in shares
+            ]
+            
+            dir_infos_set = set([file_info for file_info in file_infos if fileinfo_is_dir(file_info)])
+            self.done = True
+
+        return dir_infos_set, file_infos
+
+    def isDone(self):
+        return self.done
+
 class FilterFileInfoIterator(FileInfoIterator):
     def __init__(self, it, filter_string, ignore_case, *args, **kwargs):
         """
@@ -3785,7 +4072,14 @@ class FilterFileInfoIterator(FileInfoIterator):
 
             all_file_infos.extend(file_infos)
             
-            if (len(all_file_infos) >= batch_size):
+            # Use smaller batches for filtered items, this allows providing
+            # results earlier
+            
+            # XXX The whole point of batching is to tradeoff feedback vs.
+            #     overhead, make batch size dynamic looking at time overhead?
+            #     (probably not good for filtering since matches will be
+            #     randomly clustered, but should work for regular results?)
+            if (len(all_file_infos) >= batch_size / 10):
                 break
 
         file_infos = all_file_infos
@@ -3819,6 +4113,36 @@ def safe_unicode(s):
     else:
         return unicode(s)
 
+
+class ElidableLabel(QLabel):
+    def __init__(self, text='', parent=None, mode=Qt.ElideMiddle):
+        super(ElidableLabel, self).__init__(text, parent)
+        self._elide_mode = mode
+        self._full_text = text
+        self.setSizePolicy(self.sizePolicy().horizontalPolicy(),
+                           self.sizePolicy().verticalPolicy())
+
+    def setText(self, text):
+        """Store the full text and update display."""
+        self._full_text = text
+        self.update()
+
+    def text(self):
+        return self._full_text
+
+    def paintEvent(self, event):
+        """Custom paint to draw elided text."""
+        painter = QPainter(self)
+        elided = self.fontMetrics().elidedText(self._full_text, self._elide_mode, self.width())
+        painter.drawText(self.rect(), self.alignment(), elided)
+    
+    def sizeHint(self):
+        """Return the size of full text for layout initialization."""
+        return self.fontMetrics().size(0, self._full_text)
+
+    def minimumSizeHint(self):
+        """Allow it to shrink to the width of an ellipsis."""
+        return self.fontMetrics().size(0, '...')
 
 class EditablePopupMenu(QMenu):
     """
@@ -4289,12 +4613,13 @@ class DirectoryModel(QAbstractTableModel):
 
         dllext = ".wfx" if platform_is_32bit() else ".wfx64"
         wfx_infos = [
-            WFXInfo(SHARE_ROOT + "\\webdav", R"_out\davplug\davplug" + dllext),
-            WFXInfo(SHARE_ROOT + "\\sftp", R"_out\sftpplug\sftpplug" + dllext) ,
+            # XXX Use FsGetDefRootName for the root
+            WFXInfo(SHARE_ROOT + "\\webdav", os.path.join(OUT_DIR, "davplug", "davplug" + dllext)),
+            WFXInfo(SHARE_ROOT + "\\sftp", os.path.join(OUT_DIR, "sftpplug", "sftpplug" + dllext)),
             # XXX Disabled for now since it's crashing, it's from double
             #     commander and has extra entry points, may not be enough with
             #     hooking the total commander ones
-            # WFXInfo(SHARE_ROOT + "\\ftp", R"_out\ftp\ftp.wfx"),
+            # WFXInfo(SHARE_ROOT + "\\ftp", os.path.join(OUT_DIR, "ftp", "ftp.wfx")),
         ]
 
         if (self.filter_string != ""):
@@ -4332,7 +4657,11 @@ class DirectoryModel(QAbstractTableModel):
                 # Can't recurse into the entries since they are different WFX
                 # plugins, disable
                 it = CsvFileInfoIterator(l, SHARE_ROOT + "\\", False)
-                
+
+        elif (file_dir.startswith("\\\\") and (file_dir.rindex("\\") == 1)):
+            server = file_dir
+            it = Win32SharesFileInfoIterator(server)
+            
         elif (os.path.isdir(file_dir)):
             try:
                 it = Win32FileInfoIterator(file_dir, recurse)
@@ -4354,16 +4683,15 @@ class DirectoryModel(QAbstractTableModel):
             dllext = ".wcx" if platform_is_32bit() else ".wcx64"
 
             # XXX Refactor below into table
-            # XXX Fix for 32-bit, pass multiple DLLs? preload the DLL?
             # XXX All these should fall back to the plugin's "CanYouHandleThisFile" function
             if (ext_lower in TOTAL7ZIP_EXTENSIONS):
-                it = WCXFileInfoIterator(R"_out\total7zip\total7zip" + dllext, arcpath, dirpath, recurse)
+                it = WCXFileInfoIterator(os.path.join(OUT_DIR, "total7zip", "total7zip" + dllext), arcpath, dirpath, recurse)
                 
             elif (ext_lower == ".bz2"):
-                it = WCXFileInfoIterator(R"_out\bzip2dll" + dllext, arcpath, dirpath, recurse)
+                it = WCXFileInfoIterator(os.path.join(OUT_DIR, "bzip2dll" + dllext), arcpath, dirpath, recurse)
                 
             elif (ext_lower == ".iso"):
-                it = WCXFileInfoIterator(R"_out\iso" + dllext, arcpath, dirpath, recurse)
+                it = WCXFileInfoIterator(os.path.join(OUT_DIR, "iso" + dllext), arcpath, dirpath, recurse)
                 
             else:
                 # XXX This is hit when there's a permission violation accessing
@@ -4427,6 +4755,15 @@ class DirectoryModel(QAbstractTableModel):
         #       this should use an approach similar to sort where entries are 
         #       sorted and added wholesale and only permanent indices are 
         #       preserved
+            
+        # XXX If file_dir and recurse match, do the filtering on the existing
+        #     file_infos instead of performing the search/directory listing
+        #     again
+
+        # XXX Columns don't expand, investigate. Probably because on slow
+        #     filters results are not available when the column resize is done,
+        #     needs to resize when the first direntry is received, or with a rate
+        #     limiter, etc. Happens with both setSearchString and setDirectory
             
         if (is_search_string):
             self.setSearchString(file_dir)
@@ -4551,7 +4888,7 @@ class DirectoryModel(QAbstractTableModel):
             # - recurse sends dot even if nodot is set
             # - recurse doesn't send dot or dotdot for a subdir if the directory
             #   is empty
-            assert None is logger.info("Received direntry %s", file_infos)
+            assert None is logger.debug("Received direntry %s", file_infos)
 
             # Note because of using named tuples, subdir_fileinfo reference
             # changes on every size modification, refresh it
@@ -4951,11 +5288,14 @@ class DirectoryModel(QAbstractTableModel):
             #     (which may be ok since the panel doesn't display a directory
             #     recursively and the signal will still trigger if some parent is
             #     deleted?)
+            # XXX This doesn't seem to watch for attribute changes in existing
+            #     files either (eg date, size)
+            # XXX Check performance on network folders and allow to disable?
             self.watcher = QFileSystemWatcher([watch_dir])
-            # XXX What if the directory (or file in case of archives) is removed? or
-            #     generally if the directory is invalid? Should setDirectory to the
-            #     deepest valid path
-            self.watcher.directoryChanged.connect(self.reloadDirectory)
+            # XXX What if the directory (or file in case of archives) is
+            #     removed? or generally if the directory is invalid? Should
+            #     setDirectory to the deepest valid path
+            self.watcher.directoryChanged.connect(lambda : self.reloadDirectory())
             
         # XXX getFiles can fail for eg permission errors, don't set file_dir
         #     until getFiles works and return error or raise
@@ -5732,7 +6072,13 @@ class FilePane(QWidget):
         # Filter string as entered in the dialog box, may be different from the
         # one in the model since the one in the model is escaped for RegExp
         self.filter_string = ""
-        self.filter_is_regexp = True
+        self.filter_is_regexp = False
+
+        # selectFiles dialog box last used settings
+        self.select_string = ""
+        self.select_ignore_case = True
+        self.select_is_regexp = False
+
         
         self.display_width = display_width
 
@@ -5751,9 +6097,8 @@ class FilePane(QWidget):
         #     this
         self.disk_info_label = QLabel("C:\ 0000 k of 00000 k free")
         self.summary_label = QLabel("0k / 0k in 0 / 0 files, 0 / 0 dirs")
-        # XXX This needs to be able to elide for very long dir names, see 
-        #     https://stackoverflow.com/questions/68092087/one-line-elideable-qlabel
-        self.directory_label = QLabel(self.file_dir)
+        # Without elision the window won't resize below the label's width
+        self.directory_label = ElidableLabel(self.file_dir)
 
         self.setModels(model)
 
@@ -6148,9 +6493,13 @@ class FilePane(QWidget):
     def filterFiles(self):
         logger.info("")
 
-        # Use a standard inputdialog and add a checkbox
+        # Use a standard inputdialog and add a few checkboxes
         dialog = QInputDialog(self)
         dialog.setWindowTitle("Filter Files")
+        # Dialog can be too small for the title and elides, use some safeguard
+        # for the close and minimize buttons
+        # XXX There isn't a Qt way of getting those, use win32 api?
+        dialog.resize(dialog.fontMetrics().width(dialog.windowTitle()) + 96*2, dialog.sizeHint().height())
         dialog.setLabelText("Filter String (empty to disable):")
         dialog.setTextValue(self.filter_string)
         
@@ -6180,11 +6529,15 @@ class FilePane(QWidget):
         #     - only files (don't show dirs)
         #     - find duplicates
         #    Roll a full featured QDialog from scratch
-
-        if (dialog.exec_() == QInputDialog.Accepted):
-            self.setFilterString(self.file_dir, self.search_mode, dialog.textValue(), 
+        
+        # XXX Store filter history somewhere
+        while (dialog.exec_() == QInputDialog.Accepted):
+            ret = self.setFilterString(self.file_dir, self.search_mode, dialog.textValue(), 
                 regexpCheckbox.isChecked(), recurseCheckbox.isChecked(), 
                 caseCheckbox.isChecked())
+
+            if (not ret):
+                continue
             
             # Update the tab so the filtering indicator shows/hides in case it
             # was enabled/disabled
@@ -6192,6 +6545,7 @@ class FilePane(QWidget):
             #     are no results, fix
             # XXX The columns are not resized to contents properly, fix
             self.updateDirectoryLabel()
+            break
 
     def sortByColumn(self, col, order):
         """
@@ -6233,15 +6587,9 @@ class FilePane(QWidget):
                 self.directory_label.setText("sizedupe: dupe: !thumbs type:folder ext:jpg \"exact phrase\" <this | that>")
 
         else:
-            # QLabel doesn't support elision, do poor man's elision
-            # XXX Remove once the label supports relision
-            elided_dir = self.model.file_dir
-            max_length = 63
-            # XXX Looks like file_dir is None at initialization, fix?
-            if ((elided_dir is not None) and (len(elided_dir) > max_length)):
-                elided_dir = elided_dir[:(max_length-3) / 2] + "..." + elided_dir[-(max_length-3) / 2:]
             self.directory_label.setEnabled(True)
-            self.directory_label.setText(elided_dir)
+            self.directory_label.setText(self.model.file_dir)
+        self.directory_label.setToolTip(self.directory_label.text())
 
         label_text = ("search:" + self.search_string) if self.search_mode else self.model.file_dir
         # Don't emit None as it will crash silently
@@ -6330,15 +6678,19 @@ class FilePane(QWidget):
             total_size += size
             selected_size += size if is_selected else 0
         logger.info("Calculated total and selected sizes")
-            
-        self.summary_label.setText("%s k / %s k in %s / %s files, %s / %s dirs" % (
+
+        pending_indicator = "?" if (self.model.canFetchMore(QModelIndex())) else ""
+        self.summary_label.setText("%s k / %s%s k in %s / %s%s files, %s / %s%s dirs" % (
             # XXX Show the selected size in smaller units?
             locale.toString(selected_size / 2**10),
             locale.toString(total_size / 2**10),
+            pending_indicator,
             locale.toString(selected_files),
             locale.toString(total_files),
+            pending_indicator,
             locale.toString(selected_dirs),
-            locale.toString(total_dirs)
+            locale.toString(total_dirs),
+            pending_indicator
         ))
         
         # The loading indicator is shown in the tab title, which takes from the
@@ -6410,8 +6762,21 @@ class FilePane(QWidget):
                 qDebounceCall(self.searchEverything, 1000)
 
     def searchEverything(self):
+        # Disable filters
+        # XXX Should filters be pushed to history?
+        if (self.filter_string != ""):
+            self.filter_string = ""
+            # Access the model fields directly instead of calling setSearchString 
+            # to prevent a double listing
+            # XXX Make so DirectoryModel.setSearchString doesn't cause a
+            #     directory listing?
+            self.model.filter_string = ""
+            
         try:
             self.model.setSearchString(self.file_dir)
+
+            # XXX This leaves the cursor offscroll, missing scrolling to the
+            #     top, best yet try to preserve the current index
             
             # XXX Search string normally doesn't use a thread, so it fails to
             #     display the loading indicator, fix?
@@ -6437,27 +6802,33 @@ class FilePane(QWidget):
         #    self.table_view.horizontalHeader().setSectionResizeMode(i + 2, QHeaderView.ResizeToContents)
 
     def setFilterString(self, file_dir, search_mode, filter_string, is_regexp, recurse, ignore_case):
+        """
+        @return False on error
+        """
         logger.info("file_dir %r search_mode %s filter_string %r is_regexp %s recurse %s ignore_case %s", 
             file_dir, search_mode, filter_string, is_regexp, recurse, ignore_case)
 
         # Make sure the regexp is valid so it doesn't raise deep in the
         # FilterFileInfoIterator
         try:
-            filter_pattern = filter_string if is_regexp else re.escape(filter_string)
+            # Empty string on fnmatch converts to non-empty regexp, but empty
+            # string means no filter so needs to be preserved
+            # XXX This is also done at init time, refactor
+            filter_pattern = filter_string if (is_regexp or (filter_string == "")) else fnmatch.translate(filter_string)
             re.compile(filter_pattern, re.IGNORECASE if ignore_case else 0)
 
         except Exception as e:
             # XXX Compile this in the UI side of things to test and warn the user?
-            logger.warn("Error compiling filter regexp %r %r", filter_pattern, e)
+            logger.warn("Error compiling regexp %r %r", filter_pattern, e)
 
             QMessageBox.warning(
                 self, "Filter Files", "Invalid regular expression '%r'" % filter_pattern,
                 buttons=QMessageBox.Ok,
                 defaultButton=QMessageBox.Ok
             )
-            return
+            return False
 
-        
+
         self.filter_is_regexp = is_regexp
         self.filter_string = filter_string
 
@@ -6469,6 +6840,9 @@ class FilePane(QWidget):
         self.file_dir = file_dir
         self.model.setFilterString(file_dir, search_mode, filter_pattern, recurse, ignore_case)
 
+        # XXX This leaves the cursor offscroll, missing scrolling to the
+        #     top, best yet try to preserve the current index
+
         # The model already updates the summary when rows are added/deleted, but
         # if not rows were added/deleted still need to update the loading
         # indicator when the thread ends.
@@ -6477,6 +6851,8 @@ class FilePane(QWidget):
         # connect above (can't move the connect to the thread creation because 
         # the model should have no knowledge of views)
         self.updateSummary()
+
+        return True
 
     def setupActions(self):
         # Override the default tableview copy action which only copies the
@@ -6502,7 +6878,6 @@ class FilePane(QWidget):
         self.parentDirAct = QAction('Parent Directory', self, triggered=self.gotoParentDirectory, shortcutContext=Qt.WidgetWithChildrenShortcut)
         self.parentDirAct.setShortcuts(["backspace", "ctrl+PgUp"])
         self.childDirAct = QAction('Child Directory', self, shortcut="ctrl+PgDown", triggered=self.gotoChildDirectory, shortcutContext=Qt.WidgetWithChildrenShortcut)
-        # XXX Missing PgDown to enter current directory
         self.prevDirectoryAct = QAction('Previous Directory', self, shortcut="alt+left", triggered=lambda : self.gotoHistoryDirectory(-1), shortcutContext=Qt.WidgetWithChildrenShortcut)
         self.nextDirectoryAct = QAction('Next Directory', self, shortcut="alt+right", triggered=lambda : self.gotoHistoryDirectory(1), shortcutContext=Qt.WidgetWithChildrenShortcut)
         self.chooseDirectoryAct = QAction('Choose Directory', self, shortcut="alt+down", triggered=self.chooseHistoryDirectory, shortcutContext=Qt.WidgetWithChildrenShortcut)
@@ -6532,12 +6907,18 @@ class FilePane(QWidget):
 
         self.selectAndAdvanceAct = QAction("Select and Advance", self, shortcut="insert", triggered=self.selectAndAdvance, shortcutContext=Qt.WidgetWithChildrenShortcut)
         self.invertSelectionAct = QAction("Invert Selection", self, shortcut="ctrl+b", triggered=self.invertSelection, shortcutContext=Qt.WidgetWithChildrenShortcut)
+        self.selectFilesAct = QAction("Select Files...", self, shortcut="alt++", triggered=lambda : self.selectFiles(True), shortcutContext=Qt.WidgetWithChildrenShortcut)
+        self.deselectFilesAct = QAction("Deselect Files...", self, shortcut="alt+-", triggered=lambda : self.selectFiles(False), shortcutContext=Qt.WidgetWithChildrenShortcut)
         self.selectAllOrClearAct = QAction("Select all/None", self, shortcut="ctrl+a", triggered=self.selectAllOrClear, shortcutContext=Qt.WidgetWithChildrenShortcut)
 
         self.openInExternalViewerAct = QAction("Open in External Viewer", self, shortcut="F3", triggered=self.openInExternalViewer, shortcutContext=Qt.WidgetWithChildrenShortcut)
+        self.openInExternalEditorAct = QAction("Open in External Editor", self, shortcut="F4", triggered=self.openInExternalEditor, shortcutContext=Qt.WidgetWithChildrenShortcut)
+        self.openInCmdLineAct = QAction("Open In Command Line", self, shortcut="ctrl+.", triggered=self.openInCmdLine, shortcutContext=Qt.WidgetWithChildrenShortcut)
 
         # XXX LineEdit with directory name, bookmarks/favorites/history combobox
         # XXX Allow filtering files by typing name
+        # XXX Allow multi renaming 
+        # XXX Switch tab with ctrl+1..9
         
         self.addAction(self.copyFilepathsAct)
         self.addAction(self.copyFilesAct)
@@ -6565,8 +6946,12 @@ class FilePane(QWidget):
         self.addAction(self.switchViewAct)
         self.addAction(self.selectAndAdvanceAct)
         self.addAction(self.invertSelectionAct)
+        self.addAction(self.selectFilesAct)
+        self.addAction(self.deselectFilesAct)
         self.addAction(self.selectAllOrClearAct)
         self.addAction(self.openInExternalViewerAct)
+        self.addAction(self.openInExternalEditorAct)
+        self.addAction(self.openInCmdLineAct)
         self.addAction(self.toggleSearchModeAct)
         self.addAction(self.sortByNameAct)
         self.addAction(self.sortByDateAct)
@@ -6587,12 +6972,12 @@ class FilePane(QWidget):
 
     def selectAllOrClear(self):
         logger.info("")
-        # Clear the selection if more than half are selected, otherwise select
-        # all (use more than half as a heuristic)
+        # Select all if there's no selection, otherwise clear
         # XXX How does this interact with incremental loading? What if not all
         #     the rows are loaded?
-        if (len(self.getActiveView().selectionModel().selectedRows()) >= (self.model.rowCount() / 2)):
+        if (len(self.getActiveView().selectionModel().selectedRows()) != 0):
             self.getActiveView().clearSelection()
+
         else:
             self.getActiveView().selectAll()
             # Deselect ".."
@@ -6620,19 +7005,102 @@ class FilePane(QWidget):
         if (index.isValid() and (index.data(Qt.UserRole).filename == "..")):
             selection_model = self.getActiveView().selectionModel()
             selection_model.select(index, QItemSelectionModel.Deselect | QItemSelectionModel.Rows)
-    
+
+    def selectFiles(self, select):
+        logger.info("")
+
+        # Use a standard inputdialog and add a checkbox
+        dialog = QInputDialog(self)
+        dialog.setWindowTitle("Select Files" if select else "Deselect Files")
+        # Dialog can be too small for the title and elides, use some safeguard
+        # for the close and minimize buttons
+        # XXX There isn't a Qt way of getting those, use win32 api?
+        dialog.resize(dialog.fontMetrics().width(dialog.windowTitle()) + 96*2, dialog.sizeHint().height())
+        dialog.setLabelText("String:")
+        dialog.setTextValue(self.select_string)
+        
+        dialog.setOkButtonText("OK")
+        dialog.setCancelButtonText("Cancel")
+
+        # Insert checkbox into dialog's layout before the buttons, which are the
+        # last widget
+
+        regexpCheckbox = QCheckBox("Use RegExp", dialog)
+        regexpCheckbox.setChecked(self.select_is_regexp)
+        qInsertDialogWidget(dialog, regexpCheckbox, -1)
+
+        caseCheckbox = QCheckBox("Ignore Case", dialog)
+        caseCheckbox.setChecked(self.select_ignore_case)
+        qInsertDialogWidget(dialog, caseCheckbox, -1)
+
+        # XXX Missing other options like
+        #     - search in contents
+        #     - search in selection
+        #     - only files (don't show dirs)
+        #     - find duplicates
+        #     - toggle selection?
+        #     - clear selection?
+        #     - select by date/attribs?
+        #     - invert selection?
+        #    Roll a full featured QDialog from scratch
+        
+        # XXX Store mask history somewhere
+
+        while (dialog.exec_() == QInputDialog.Accepted):
+            string_pattern = dialog.textValue() if (regexpCheckbox.isChecked()) else fnmatch.translate(dialog.textValue())
+
+            # Guard against user invalid expression
+            try:
+                r = re.compile(string_pattern, re.IGNORECASE if (caseCheckbox.isChecked()) else 0)
+            except Exception as e:
+                # XXX Compile this in the UI side of things to test and warn the user?
+                logger.warn("Error compiling regexp %r %r", string_pattern, e)
+
+                QMessageBox.warning(
+                    self, "Select Files", "Invalid regular expression '%r'" % string_pattern,
+                    buttons=QMessageBox.Ok,
+                    defaultButton=QMessageBox.Ok
+                )
+                continue
+
+            self.select_string = dialog.textValue()
+            self.select_is_regexp = regexpCheckbox.isChecked()
+            self.select_ignore_case = caseCheckbox.isChecked()
+
+            model = self.model
+            selection_model = self.getActiveView().selectionModel()
+            
+            # XXX How does this interact with incremental loading? What if not all
+            #     the rows are loaded?
+            
+            # This can be slow with many files due to the individual signals,
+            # use a selection instead of going index by index
+            selection = QItemSelection()
+            # Table model has full row selection, so only go through rows
+            for row in xrange(model.rowCount()):
+                index = model.index(row, 0)
+                file_info = index.data(Qt.UserRole)
+                if ((r.search(file_info.filename) is not None) and (os.path.basename(file_info.filename) != "..")):
+                    selection.select(index, index)
+
+            selection_model.select(selection, (QItemSelectionModel.Select if select else QItemSelectionModel.Deselect) | QItemSelectionModel.Rows)
+            break
+        
     def selectAndAdvance(self):
         logger.info("")
         view = self.getActiveView()
         index = view.currentIndex()
-        view.selectionModel().select(index, QItemSelectionModel.Toggle | QItemSelectionModel.Rows)
+        # Don't select ".."
+        if (index.isValid() and (index.data(Qt.UserRole).filename != "..")):
+            view.selectionModel().select(index, QItemSelectionModel.Toggle | QItemSelectionModel.Rows)
         # Note this advancing works on both listview and tableview, since
         # listviews only have rows
         index = self.createRootIndex(index.row() + 1)
         if (index.isValid()):
             self.setCurrentIndex(index)
 
-    def openInExternalViewer(self):
+    def openInExternal(self, command, args = []):
+        # XXX Add substitution support same as openInCmdLine?
         logger.info("")
         def cleanup_temp_file(temp_relpath, filepath):
             logger.info("%r %r", temp_relpath, filepath)
@@ -6672,13 +7140,14 @@ class FilePane(QWidget):
             filepath = self.model.it.extract(os.path.join(self.file_dir, filename))
             if (filepath is not None):
                 p = QProcess(self)
-                arguments = ["/S=L", filepath]
+                arguments = args + [filepath]
                 # XXX At least on Windows when the app closes it doesn't kill this
                 #     process, and the temp file and path remains, needs a periodic
                 #     cleanup?
                 temp_relpath = os.path.relpath(filepath, TEMP_DIR)
                 p.finished.connect(lambda : cleanup_temp_file(temp_relpath, filepath))
-                p.start(g_external_viewer_filepath, arguments)
+                logger.info("Starting %r %r", command, arguments)
+                p.start(command, arguments)
             else:
                 QMessageBox.warning(
                     self, "View File", "Error viewing file '%r'" % filename,
@@ -6689,9 +7158,105 @@ class FilePane(QWidget):
 
         else:
             filepath = os.path.abspath(os.path.join(self.file_dir, filename))
-            arguments = ["/S=L", filepath]
+            arguments = args + [filepath]
             # Start detached will create an independent process instead of a child
-            QProcess().startDetached(g_external_viewer_filepath, arguments)
+            logger.info("Starting %r %r", command, arguments)
+            QProcess().startDetached(command, arguments)
+
+        # XXX Missing offering repacking when modified
+
+    def openInExternalViewer(self):
+        logger.info("")
+        self.openInExternal(g_external_viewer_filepath, g_external_viewer_params)
+
+    def openInExternalEditor(self):
+        logger.info("")
+        self.openInExternal(g_external_editor_filepath, g_external_editor_params)
+
+    def openInCmdLine(self, ask_command=False):
+        """
+        Open command line in the following order
+        - if a file is focused in the parent of the file (not just file_dir so
+          it works for both dir listings and searches)
+        - if a dir is focused in that dir unless ..
+        - in the current file_dir otherwise
+        """
+        global g_external_cmd_filepath
+        global g_external_cmd_params
+
+        logger.info("")
+
+        # XXX Run multiple if multiple selected?
+        # XXX Allow as admin if alt or shift pressed?
+
+        index = self.getActiveView().currentIndex()
+        if (self.model.needsExtracting()):
+            # On a packed directory go to the parent of the packed file
+            # XXX What about SHARE_ROOT?
+            dirpath = os.path.dirname(os_path_physpath(self.file_dir))
+
+        else:
+            # On a regular directory, go to the parent of the file (which may be
+            # different from file_dir in filters and searches)
+            dirpath = self.file_dir
+            if (index.isValid()):
+                file_info = index.data(Qt.UserRole)
+                if (file_info.filename != ".."):
+                    dirpath = os.path.join(dirpath, file_info.filename)
+                if (not fileinfo_is_dir(file_info)):
+                    dirpath = os.path.dirname(dirpath)
+
+        if (index.isValid()):
+            file_info = index.data(Qt.UserRole)
+            filepath = os.path.join(self.file_dir, file_info.filename)
+            filename = os.path.basename(filepath)
+            dirname = os.path.basename(os.path.dirname(filepath))
+            dirpathname = os.path.basename(dirpath)
+
+        else:
+            filename = os.path.basename(self.file_dir)
+            filepath = self.file_dir
+            dirname = os.path.basename(self.file_dir)
+            dirpathname = os.path.basename(dirpath)
+
+        def make_replacements(s):
+            # XXX This could have some array syntax for multiple selection?
+            s = s.replace("%0", dirpath)
+            s = s.replace("%1", filepath)
+            s = s.replace("%2", filename)
+            s = s.replace("%3", dirpathname)
+            s = s.replace("%4", dirname)
+            return s 
+
+        description = "Command Line:\n%%0 dirpath: %r\n%%1 filepath: %r\n%%2 basename: %r\n%%3 dirpathname: %r\n%%4 dirname: %r" % tuple([make_replacements("%%%d" % i) for i in xrange(5)])
+
+        text, ok = QInputDialog.getText(
+            self, 
+            "Run Command",  
+            description,
+            QLineEdit.Normal, g_external_cmd_filepath + " " + string.join(g_external_cmd_params)
+        )
+
+        logger.info("%r", text)
+        if ((not ok) or (text == "")):
+            return
+        # XXX This doesn't allow a command name with spaces in it, allow some
+        #     kind of escaping/quoting?
+        parts = text.split()
+
+        # XXX Store a list of these instead of overwriting and then offer them
+        #     in the dialog box? But then it needs to allow deleting entries
+        g_external_cmd_filepath = parts[0]
+        g_external_cmd_params = parts[1:]
+
+        parts = [
+            make_replacements(part) for part in parts
+        ]
+        command = parts[0]
+        arguments = parts[1:]
+
+        logger.info("Starting %r %r", command, arguments)
+        QProcess().startDetached(command, arguments)
             
     def resizeIcons(self, delta):
         logger.info("%d + %d", self.display_width, delta)
@@ -6899,7 +7464,8 @@ class FilePane(QWidget):
                 self.search_string_timer.timeout.emit()
             if (self.isForciblyBrowsable(file_info)):
                 logger.info("Navigating to child %r", file_info.filename)
-                # Use normpath, translate .. into parent
+                # Use normpath: translate .. into parent, remove trailing slash
+                # unless root
                 dirpath = os.path.normpath(os.path.join(self.file_dir, file_info.filename))
 
             else:
@@ -6910,7 +7476,7 @@ class FilePane(QWidget):
             self.setDirectory(dirpath)
             
     def gotoParentDirectory(self):
-        parent_path = os.path.dirname(self.file_dir)
+        parent_path = os_path_dirname(self.file_dir)
         logger.info("%r", parent_path)
         if (parent_path != self.file_dir):
             self.setDirectory(parent_path)
@@ -6941,6 +7507,13 @@ class FilePane(QWidget):
         if (index.isValid() and (index.data(Qt.UserRole).filename == "..")):
             return
 
+        # XXX Make this animate the per directory loading icon? (that one comes
+        #     from DirectoryModel.data())
+        # XXX Find out why folder icon only updates when navigated, probably
+        #     updating on demand is disabled and too expensive, put update on a
+        #     timer / rate limiting?
+        # XXX Make this show and animate the tab loading icon? (sometimes it works
+        #     sometimes it doesn't?)
         view = self.getActiveView()
         if ((view == self.table_view) and (not view.selectionModel().isSelected(index))):
             self.model.calculateSubdirSizes(index)
@@ -7045,6 +7618,8 @@ class FilePane(QWidget):
         #     headers are larger than the content, but they are currently not
         # Data has changed, autoresize the necessary columns
         # XXX This should probably go through signals?
+        # XXX This needs to be done as entries are received, otherwise it
+        #     can happen too early on slow listings
         self.table_view.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
         for i in xrange(4):
             self.table_view.horizontalHeader().setSectionResizeMode(i + 2, QHeaderView.ResizeToContents)
@@ -7083,7 +7658,7 @@ class FilePane(QWidget):
 
         index = self.createRootIndex()
         # If going up to the parent directory, focus on the children just left
-        if (os.path.dirname(old_file_dir) == self.file_dir):
+        if (os_path_dirname(old_file_dir) == self.file_dir):
             # Focus on the incoming dir, could fail if didn't sleep enough time
             # to list this directory, or if it didn't sleep enough to increase
             # loaded_rows 
@@ -7103,7 +7678,7 @@ class FilePane(QWidget):
                 # given entry
                 try:
                     
-                    row = self.model.findFileInfoRow(os.path.basename(old_file_dir))
+                    row = self.model.findFileInfoRow(os_path_basename(old_file_dir))
                     index = self.createRootIndex(row)
                     logger.info("Created index %r row %d vs. row %d", index.data(Qt.DisplayRole), index.row(), row)
                     # XXX This is failing to focus even if hasIndex is True, but
@@ -7145,6 +7720,11 @@ class FilePane(QWidget):
             self.search_string_timer.stop()
             self.search_string_timer.timeout.emit()
             
+        # XXX Do it in a new tab if ctrl is pressed, on the other pane if shift
+        #     is pressed. Need to push to the TwinWindow, can't just access
+        #     qTabWidgetFromPage here since it also needs TwinWindow's
+        #     createPane
+
         file_info = index.data(Qt.UserRole)
         filename = file_info.filename
         logger.info("%d %r", index.row(), file_info)
@@ -7155,7 +7735,8 @@ class FilePane(QWidget):
             hwnd = qFindMainWindow().winId().__int__()
             verb = "open"
             
-            # Prepend directory and normalize to translate .. into parent
+            # Prepend directory and normalize to translate .. into parent,
+            # remove trailing slash unless root 
             filepath = os.path.normpath(os.path.join(self.file_dir, filename))
             # Normalization can add a trailing slash when going up to the
             # parent, remove
@@ -7178,7 +7759,12 @@ class FilePane(QWidget):
                 self.setDirectory(filepath)
                 
         elif (self.isBrowsable(file_info)):
-            dirpath = os.path.normpath(os.path.join(self.file_dir, filename))
+            dirpath = None
+            if (filename == ".."):
+                dirpath = os_path_dirname(self.file_dir)
+
+            else:
+                dirpath = os.path.join(self.file_dir, filename)
             self.setDirectory(dirpath)
   
         else:
@@ -7216,7 +7802,6 @@ class FilePane(QWidget):
     
     def switchView(self):
         """ Switch between ListView and TableView """
-        # XXX Do selected items need transferring too?
         logger.info("")
         if (self.getActiveView() is self.list_view):
             index = self.list_view.currentIndex()
@@ -7242,6 +7827,9 @@ class FilePane(QWidget):
 
             self.setCurrentIndex(index)
             self.scrollTo(index)
+
+        # Note the selected model is shared between table and list, no need to
+        # transfer across
         
         self.updatePageSize()
 
@@ -7314,9 +7902,11 @@ class FilePane(QWidget):
         # XXX Probably due to focuspolicy? Is there a FilePane focus policy that
         #     would work?
         if (event.type() == QEvent.FocusOut):
+            # Set the original style removing the background color
             self.directory_label.setStyleSheet("text-align: left;")
 
         elif (event.type() == QEvent.FocusIn):
+            # Set the accent background color
             color = QColor()
             color.setNamedColor("#cceeff")
             color = color.darker(125)
@@ -7416,6 +8006,8 @@ class FilePane(QWidget):
               # event.text() returns empty for cursor, etc which triggers the
               # "in" clause, ignore
               ((event.text() != "") and (event.text() in (string.digits + string.letters + string.punctuation + " "))) and
+              # Ignore if alt is pressed with +-, used to select/deselect files
+              ((not (event.modifiers() & Qt.AltModifier)) or (event.text() not in "+-")) and
               # Only allow spacebar on non empty string, so it still works as
               # selection toggle
               ((event.text() != " ") or ((self.search_string != "") and (not self.search_string.endswith(" "))))
@@ -7467,7 +8059,15 @@ class FilePane(QWidget):
                 # previous directory listing and they would to the current grid but
                 # fail to load due to the changed path
                 logger.info("Disconnecting signal from old DirectoryReader finished %s running %s", self.model.directoryReader.isFinished(), self.model.directoryReader.isRunning())
-                self.model.directoryReader.direntryRead.disconnect()
+                # This can fail with 
+                #  TypeError: disconnect() failed between 'direntryRead' and all its connections
+                # when there are no connections, trap and ignore
+                try:
+                    self.model.directoryReader.direntryRead.disconnect()
+                except TypeError:
+                    logger.warn("Unable to disconnect, probably no connections")
+                # XXX Cancelling loading by pressing ESC (or pressing Cancel in
+                #     the dialog box) no longer works, fix
                 self.model.directoryReader.abort()
 
             # Reset the search string if there was any, ESC is the fast way of
@@ -7495,18 +8095,15 @@ class FilePane(QWidget):
                self.model.fetchMore(QModelIndex())
         
     def openDirectory(self):
-        logger.info("Requesting new directory default is %r", self.file_dir)
-        # XXX Disable the action when use_everything? or just switch back to
-        #     directory mode? Note this is also called explicitly, so disabling
-        #     the action is not enough, also needs to be ignored here
+        file_dir = self.old_file_dir if self.search_mode else self.file_dir
+        logger.info("Requesting new directory, default is %r", file_dir)
         # XXX Have openDirectory use the header bar to type the new directory
         #     instead of popping a dialog box? (but the dialog box is a
         #     directory dialog box which is sometimes convenient, also the
         #     header would need better editing support)
-        if (not self.search_mode):
-            file_dir = qGetExistingDirectory(None, "Select Folder", self.file_dir)
-            if (file_dir != ""):
-                self.setDirectory(file_dir)
+        file_dir = qGetExistingDirectory(None, "Select Folder", file_dir)
+        if (file_dir != ""):
+            self.setDirectory(file_dir)
 
     def reloadDirectory(self, clear_cache=False):
         logger.info("clear_cache %s", clear_cache)
@@ -7893,7 +8490,13 @@ class TwinWindow(QMainWindow):
     def __init__(self, left_file_dir=None, right_file_dir=None):
         global g_localsend_myinfo
         global g_external_viewer_filepath
+        global g_external_viewer_params
         global g_external_diff_filepath
+        global g_external_diff_params
+        global g_external_editor_filepath
+        global g_external_editor_params
+        global g_external_cmd_filepath
+        global g_external_cmd_params
 
         super(TwinWindow, self).__init__()
         
@@ -7937,6 +8540,10 @@ class TwinWindow(QMainWindow):
 
                 self.chooseTab()
 
+            # Set a smaller icon size so setting an icon doesn't cause the tab
+            # height to grow/shrhink
+            tab.setIconSize(QSize(14, 14))
+            
             tab.tabBar().setContextMenuPolicy(Qt.CustomContextMenu)
             tab.tabBar().customContextMenuRequested.connect(lambda pos, tab=tab: activate_and_choose_tab(tab, pos))
 
@@ -7965,7 +8572,13 @@ class TwinWindow(QMainWindow):
         self.setGeometry(qSettingsValue(settings,"window_geometry", QRect(0,0,1024,768)))
 
         g_external_viewer_filepath = qSettingsValue(settings,"external_viewer_filepath", g_external_viewer_filepath)
+        g_external_viewer_params = qSettingsValue(settings,"external_viewer_params", g_external_viewer_params)
+        g_external_editor_filepath = qSettingsValue(settings,"external_editor_filepath", g_external_editor_filepath)
+        g_external_editor_params = qSettingsValue(settings,"external_editor_params", g_external_editor_params)
         g_external_diff_filepath = qSettingsValue(settings,"external_diff_filepath", g_external_diff_filepath)
+        g_external_diff_params = qSettingsValue(settings,"external_diff_params", g_external_diff_params)
+        g_external_cmd_filepath = qSettingsValue(settings,"external_cmd_filepath", g_external_cmd_filepath)
+        g_external_cmd_params = qSettingsValue(settings,"external_cmd_params", g_external_cmd_params)
 
         # Load keyboard shortcuts from settings, panel and tableview shortcuts
         # are loaded at panel creation time
@@ -8005,8 +8618,6 @@ class TwinWindow(QMainWindow):
                 # XXX Poking into the model this way is not nice, but it's only
                 #     needed to hold the values until used below in the second
                 #     initialization step, fix?
-                filter_pattern = file_pane.filter_string if file_pane.filter_is_regexp else re.escape(file_pane.filter_string)
-                file_pane.model.filter_string = filter_pattern
                 file_pane.model.filter_recurse = qSettingsValue(settings, "filter_recurse", file_pane.model.filter_recurse)
                 file_pane.model.filter_ignore_case = qSettingsValue(settings, "filter_ignore_case", file_pane.model.filter_ignore_case)
 
@@ -8043,12 +8654,16 @@ class TwinWindow(QMainWindow):
             g_localsend_myinfo = json.loads(myinfo)
         settings.endGroup()
 
+        # If no panes, make sure there are valid default file_dir for left or
+        # right
         if ((len(self.left_panes) == 0) and (left_file_dir is None)):
             left_file_dir = os.getcwd()
 
         if ((len(self.right_panes) == 0) and (right_file_dir is None)):
             right_file_dir = os.getcwd()
 
+        # If there are a default file_dir because of no panes or a command line
+        # argument, create tha panes for those
         if (left_file_dir is not None):
             tab = self.left_tab
             file_pane = self.createPane(tab)
@@ -8077,14 +8692,17 @@ class TwinWindow(QMainWindow):
             file_pane.search_mode = file_dir.startswith("search:")
             file_dir = file_dir[len("search:"):] if (file_pane.search_mode) else file_dir
 
+            filter_success = False
             if (file_pane.filter_string != ""):
-                file_pane.setFilterString(file_dir, file_pane.search_mode, file_pane.filter_string, file_pane.filter_is_regexp, file_pane.model.filter_recurse, file_pane.model.filter_ignore_case)
+                filter_success = file_pane.setFilterString(file_dir, file_pane.search_mode, file_pane.filter_string, file_pane.filter_is_regexp, file_pane.model.filter_recurse, file_pane.model.filter_ignore_case)
+                
+            # Fall-back to non-filter on error
+            if (not filter_success):
+                if (file_pane.search_mode):
+                    file_pane.setSearchString(file_dir)
 
-            elif (file_pane.search_mode):
-                file_pane.setSearchString(file_dir)
-
-            else:
-                file_pane.setDirectory(file_dir, False)
+                else:
+                    file_pane.setDirectory(file_dir, False)
 
         if (current_pane == "left"):
             self.getLeftPane().getActiveView().setFocus()
@@ -8109,15 +8727,16 @@ class TwinWindow(QMainWindow):
         #     etc
 
         # active_pane can be None at startup
-        if (active_pane is not None):
-            self.setWindowTitle("Twin - %s" % active_pane.file_dir)
+        self.setWindowTitle("Twin %s - %s" % (APPLICATION_VERSION, "Loading..." if (active_pane is None) else active_pane.file_dir))
         
     def setupActions(self):
-        
+
         self.nextPaneAct = QAction("Next Pane", self, shortcut="tab", triggered=self.nextPane)
 
         self.leftToRightAct = QAction("Left to Right", self, shortcut="ctrl+right", triggered= lambda : self.leftToRight())
+        self.leftToRightAct.setShortcuts(["ctrl+right", "ctrl+shift+right"])
         self.rightToLeftAct = QAction("Right to Left", self, shortcut="ctrl+left", triggered= lambda: self.leftToRight(True))
+        self.rightToLeftAct.setShortcuts(["ctrl+left", "ctrl+shift+left"])
 
         self.copySelectedFilesAct = QAction("Copy Files", self, shortcut="F5", triggered=self.copySelectedFiles, shortcutContext=Qt.ApplicationShortcut)
         self.moveSelectedFilesAct = QAction("Move Files", self, shortcut="F6", triggered=self.moveSelectedFiles, shortcutContext=Qt.ApplicationShortcut)
@@ -8133,11 +8752,13 @@ class TwinWindow(QMainWindow):
         self.closeTabAct = QAction("Close Tab", self, triggered=self.closeTab, shortcutContext=Qt.ApplicationShortcut)
         self.closeTabAct.setShortcuts(["ctrl+w", "ctrl+shift+t"])
 
+        self.aboutAct = QAction("About", self, shortcut="F1", triggered=self.about, shortcutContext=Qt.ApplicationShortcut)
         self.profileAct = QAction("Profile", self, shortcut="ctrl+p", triggered=self.profile, shortcutContext=Qt.ApplicationShortcut)
 
         # XXX LineEdit with directory name, bookmarks/favorites/history combobox
         # XXX Allow filtering files by typing name
-        # XXX Add reopen "last closed tab"
+        # XXX Undo close tab, keep undo stack of closed tab bookmarks, store in
+        #     settings?
         
         self.addAction(self.nextPaneAct)
         self.addAction(self.chooseBookmarkAct)
@@ -8150,6 +8771,7 @@ class TwinWindow(QMainWindow):
         self.addAction(self.diffDirsAct)
         self.addAction(self.diffExternallyAct)
         self.addAction(self.swapPanesAct)
+        self.addAction(self.aboutAct)
         self.addAction(self.profileAct)
 
     def leftToRight(self, reverse=False):
@@ -8157,6 +8779,22 @@ class TwinWindow(QMainWindow):
 
         source_pane = self.getRightPane() if reverse else self.getLeftPane()
         target_pane = self.getLeftPane() if reverse else self.getRightPane()
+        target_tab = qTabWidgetFromPage(target_pane)
+
+        # Work in a new pane if shift is pressed
+        
+        # XXX This is inconsistent with ctrl = New pane, shift = other pane,
+        # rethink?
+        # - chooseTab, chooseBookmark shift: open in other pane
+        # - chooseTab, chooseBookmark ctrl: open in new pane
+        # - gotoHistory not yet, but would like to 
+        if (qApp.keyboardModifiers() & Qt.ShiftModifier):
+            target_pane = self.createPane(
+                target_tab, 
+                source_pane.display_width, 
+                source_pane.model.sort_column, 
+                source_pane.model.sort_order
+            )
 
         # - if the cursor is on the target pane, use the source pane's dirpath/search string
         # - If the cursor is on the source pane and over a non  ".." directory,
@@ -8172,6 +8810,9 @@ class TwinWindow(QMainWindow):
                 source_pane.isBrowsable(file_info) and (file_info.filename != "..")):
                 dirpath = os.path.join(dirpath, file_info.filename)
                 search_mode = False
+
+        # In case a new pane was created need to set the pane current in the tab
+        target_tab.setCurrentWidget(target_pane)
             
         if (search_mode):
             target_pane.search_mode = True
@@ -8423,7 +9064,7 @@ class TwinWindow(QMainWindow):
             #     kdiff3 accept list of files?
             return
 
-        arguments = [src_filepath, dst_filepath]
+        arguments = g_external_diff_params + [src_filepath, dst_filepath]
         # Start detached will create an independent process instead of a child
         QProcess().startDetached(g_external_diff_filepath, arguments)
 
@@ -8514,6 +9155,7 @@ class TwinWindow(QMainWindow):
                 # XXX Have a setting to disable animation?
                 # loading_animation_timer will be None when the panel is winding
                 # down, don't restart the timer in that case
+                # XXX Can this be done with the existing rate limiter?
                 if (file_pane.loading_animation_timer is None):
                     def rotate_tab_icon(file_pane):
                         logger.info("")
@@ -8643,7 +9285,7 @@ class TwinWindow(QMainWindow):
             if (action is closeTabAct):
                 self.closeTab()
 
-            elif ((action.data() == tab.count()) or (QApplication.keyboardModifiers() & Qt.ControlModifier)):
+            elif ((action.data() == tab.count()) or (qApp.keyboardModifiers() & Qt.ControlModifier)):
                 # XXX Make it so it opens the tab on the other pane if shift is pressed?
                 # Create a new tab
                 logger.info("Creating and activating tab %d", action.data())
@@ -8754,6 +9396,9 @@ class TwinWindow(QMainWindow):
             self.bookmarks.remove(bookmark)
         
         if (action is addCurrentAct):
+            # XXX have a FilePane.createBookmark that creates a serializable
+            #     bookmark from the current state, then use it for bookmarks and
+            #     reopen closed tab
             if (active_pane.search_mode):
                 bookmark = "search:" + active_pane.search_string
             else:
@@ -8771,12 +9416,12 @@ class TwinWindow(QMainWindow):
         elif (action is not None):
             logger.info("Switching to bookmark %r", action.data())
             # Switch the other opane if shift is pressed
-            if (QApplication.keyboardModifiers() & Qt.ShiftModifier):
+            if (qApp.keyboardModifiers() & Qt.ShiftModifier):
                 tab = self.left_tab if (active_pane is self.getRightPane()) else self.right_tab
                 active_pane = self.getTargetPane()
                 
             # Switch to that bookmark, in a new tab if ctrl is pressed
-            if (QApplication.keyboardModifiers() & Qt.ControlModifier):
+            if (qApp.keyboardModifiers() & Qt.ControlModifier):
                 # XXX Insert after the current one?
                 active_pane = self.createPane(
                     tab, 
@@ -8787,6 +9432,7 @@ class TwinWindow(QMainWindow):
                 tab.setCurrentWidget(active_pane)
                 
             bookmark = action.data()
+            # XXX Use a FilePane.gotoBookmark
             if (bookmark.startswith("search:")):
                 active_pane.search_mode = True
                 active_pane.setSearchString(bookmark[len("search:"):])
@@ -8819,7 +9465,13 @@ class TwinWindow(QMainWindow):
         #     per screen resolution?
         settings.setValue("window_geometry", self.geometry())
         settings.setValue("external_viewer_filepath", g_external_viewer_filepath)
+        settings.setValue("external_viewer_params", encode_string_list(g_external_viewer_params))
+        settings.setValue("external_editor_filepath", g_external_editor_filepath)
+        settings.setValue("external_editor_params", encode_string_list(g_external_editor_params))
         settings.setValue("external_diff_filepath", g_external_diff_filepath)
+        settings.setValue("external_diff_params", encode_string_list(g_external_diff_params))
+        settings.setValue("external_cmd_filepath", g_external_cmd_filepath)
+        settings.setValue("external_cmd_params", encode_string_list(g_external_cmd_params))
         # XXX Store plugin info (and edit by hand for now?)
         for file_panes in (self.left_panes, self.right_panes):
             group_name = "left" if (file_panes is self.left_panes) else "right"
@@ -8880,7 +9532,7 @@ class TwinWindow(QMainWindow):
         import cProfile
         if (self.profiling):
             self.pr.disable()
-            self.pr.dump_stats(os.path.join("_out", "profile.prof"))
+            self.pr.dump_stats(os.path.join(OUT_DIR, "profile.prof"))
             logger.warn("Ended profiling")
             #self.showMessage("Ended profiling")
 
@@ -8892,6 +9544,18 @@ class TwinWindow(QMainWindow):
             
         self.profiling = not self.profiling
 
+    def about(self):
+        # XXX Put these in a listbox
+        action_shortcuts = qGetActionShortcuts(self) + qGetActionShortcuts(self.left_panes[0]) + qGetActionShortcuts(self.left_panes[0].table_view)
+        action_shortcuts = sorted(action_shortcuts, key=lambda a: a[0])
+        action_shortcuts_html = string.join(["<tr><td>%s</td><td>%s</td></tr>" % (name, string.join(shortcuts, " ")) for name, shortcuts in action_shortcuts])
+        QMessageBox.about(self, "About Twin %s" % APPLICATION_VERSION,
+            "<b>Twin panel playground</b>"
+            "<p>"
+            "<table>" + action_shortcuts_html + "</table>"
+            "<p>"
+            "Visit the <a href=\"https://github.com/antoniotejada/Twin\">github repo</a> for more information</p>"
+        )
 
 def restore_python_exceptions():
     # Remove pyqt except hook that hides exceptions
@@ -8916,9 +9580,13 @@ if (do_parse_test):
 
 
 def main():
-    # Let Windows 10 know this is a DPI aware app, reduces blur
+    
     try:
+        # Let Windows 10 know this is a DPI aware app, reduces blur
         ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        # Give the application its own taskbar button independent of other python
+        # programs, per docs needs to be called before any UI manipulation
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Twin " + APPLICATION_VERSION)
     except:
         logger.warn("Unable to set DPI awareness flag")
 
@@ -8930,6 +9598,9 @@ def main():
     font = app.font()
     font.setPointSize(max(1, font.pointSize() - 1))
     app.setFont(font)
+
+    # Set the floppy disk as application icon
+    app.setWindowIcon(qApp.style().standardIcon(QStyle.SP_DialogSaveButton)) 
 
     file_dirs = [None, None]
     if (len(sys.argv) > 1):

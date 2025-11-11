@@ -26,6 +26,10 @@ PyQt5 twin panel file manager playground, but functional
 
 *[Art &copy; Greg Rutkowski](https://www.artstation.com/artwork/k4lYqK)*
 
+### About with Shortcut List
+
+![twin_about](https://github.com/user-attachments/assets/7f660de1-36cf-4405-b7ab-72e1983b7f32)
+
 ## Features
 
 - Twin panel
@@ -37,11 +41,12 @@ PyQt5 twin panel file manager playground, but functional
 - Resizable thumbnails
 - Cached & background loaded thumbnails
 - Select all/none/invert files
+- Select files by fnmatch or regexp
 - Copy/Cut files to/from system clipboard
 - Copy/Move files to other panel
 - Create directory
 - Delete/rename file/directory
-- Directory comparison
+- Directory comparison internal or using external diff
 - Filename substring keyboard navigation
 - Navigation history
 - Directory size calculation in background
@@ -61,6 +66,8 @@ PyQt5 twin panel file manager playground, but functional
 - Directory background loading indicator on tab
 - Panel file filtering/finding
 - Configurable keyboard shortcuts in config file
+- Windows share listing
+- Open in external viewer, editor, command line
 
 ## TODO
 
@@ -71,7 +78,7 @@ PyQt5 twin panel file manager playground, but functional
 - Backround task management
 - Full compressed archive / WCX packer support (create, read, update, delete)
 - Drag & Drop
-- Menus, About
+- Menus
 - single http/ftp file download
 - list links in html page
 

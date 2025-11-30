@@ -68,6 +68,7 @@ PyQt5 twin panel file manager playground, but functional
 - Configurable keyboard shortcuts in config file
 - Windows share listing
 - Open in external viewer, editor, command line
+- Increase/decrease app font size
 
 ## TODO
 
@@ -105,9 +106,10 @@ External viewer (configurable)
 
 ### Localsend
 
-Install the app https://github.com/localsend/localsend
+Install the app https://github.com/localsend/localsend on the target device (no
+need to install on the Twin/source device, the support in Twin is self-contained).
 
-Send files to other machines or devices in the local network with automatic device discovery
+Send files to other machines or devices in the local network with automatic device discovery.
 
 ### kdiff3
 

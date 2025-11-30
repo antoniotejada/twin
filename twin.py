@@ -251,12 +251,25 @@ def fileinfo_cmp(a, b, field=0, reverse=False):
         else:
             res = cmp(a[field], b[field])
 
-        # Always sort by name second if equal for the current order,
-        # mergeDirEntries requires not returning equal if fileinfos are
-        # different (ie different filename) or it will fail to detect
-        # insertions/deletions
-        if ((field != 0) and (res == 0)):
-            res = cmp(a.filename.lower(), b.filename.lower())
+        # If they match by the initial comparison field, test the rest in
+        # whatever deterministic order. Can't return equal if any field
+        # mismatches because callers use this not only to sort but also to diff
+        # two lists (eg mergeDirEntries)
+        
+        # XXX fileinfo_cmp is used in mergeDirEntries to merge directory
+        #     updates, returning mismatch here is necessary to detect updates,
+        #     but also disturbs the UI (current item is moved, selection is
+        #     lost) when there's only an attribute (eg size, date) change, since
+        #     it will regard it as a deletion and an insertion. Change
+        #     mergeDirEntries so it emits datachanged instead of delete/update
+
+        # XXX Fast check for tuple equality first?
+        i = 0
+        while ((res == 0) and (i < len(a))):
+            # Note "field" has already been compared above and known to be
+            # equal, skip. Compare other fields as expected
+            res = 0 if (field == i) else (cmp(a[i], b[i]) if (i != 0) else cmp(a[i].lower(), b[i].lower()))
+            i += 1
 
         # Don't reverse directory ordering, only files
         res = -res if (reverse and not a_is_dir) else res
@@ -477,7 +490,7 @@ def os_copy(filepath, target_dir):
         target_dir = os.path.join(target_dir, os.path.basename(filepath))
         os_makedirs(target_dir)
         for filename in os.listdir(filepath):
-            os_copy(os.path.join(filepath, filename), os.path.join(target_dir, filename))
+            os_copy(os.path.join(filepath, filename), target_dir)
         shutil.copystat(filepath, target_dir)
         
     else:
@@ -1843,18 +1856,35 @@ def localsend_upload_to_device(myinfo, device, filepath):
 # - Changed non-regexp filters to fnmatch
 # - Fixed search not resetting filter
 # - Fixed fileinfo_cmp
-APPLICATION_VERSION = "0.3.0"
+# 0.4.0
+# - Fixed recursive subdirectory copying creating extra nesting
+# - Fixed copy failing to overwrite
+# - Changes for pysintaller --onefile
+# - Added application font size
+# - Added custom about dialog box
+# - Changed delete file and overwrite default to yes
+APPLICATION_VERSION = "0.4.0"
 
 # 0.0.1 Added config file
 # 0.1.0 Added sorting settings
 # 0.2.0 Added filter, shortcut settings
 # 0.3.0 Added select/deselect shortcuts, external_xxx_params and 
 #       external_editor_xxx, external_cmd_xxx
-CONFIG_FILE_VERSION = "0.3.0"
+# 0.4.0 Added application font size
+CONFIG_FILE_VERSION = "0.4.0"
 
 INCLUDE_DIR = "include"
+if (getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS')):
+    INCLUDE_DIR = os.path.join(sys._MEIPASS, INCLUDE_DIR)
 # XXX Get this from config file
 OUT_DIR = "_out"
+# XXX Decide what happens on pyinstaller frozen executables, there should
+#     probably be a frozen path and a per user or per program path for plugins, 
+#     PLUGIN_FROZEN_DIR and PLUGIN_LIVE_DIR?
+PLUGIN_DIR = "_out"
+if (getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS')):
+    PLUGIN_DIR = os.path.join(sys._MEIPASS, PLUGIN_DIR)
+
 # XXX Get this from config file
 TEMP_DIR = os.path.join(OUT_DIR, "temp")
 
@@ -2531,10 +2561,10 @@ class EverythingFileInfoIterator(FileInfoIterator):
         # On XP 32-bit there's a warning when WinDLL cannot load a DLL, don't
         # load 64 bit and fallback to 32, check 32 bit explicitly
         if (platform_is_32bit()):
-            everything_dll = ctypes.WinDLL(os.path.join(OUT_DIR, "Everything32.dll"))
+            everything_dll = ctypes.WinDLL(os.path.join(PLUGIN_DIR, "Everything32.dll"))
 
         else:
-            everything_dll = ctypes.WinDLL(os.path.join(OUT_DIR, "Everything64.dll"))
+            everything_dll = ctypes.WinDLL(os.path.join(PLUGIN_DIR, "Everything64.dll"))
             
         self.everything_dll = everything_dll
 
@@ -3241,7 +3271,7 @@ class WFXFileInfoIterator(FileInfoIterator):
         # XXX Missing setting flags
         res = c.FsGetFileW(entrypath, filepath, 0, remote_info)
 
-        # XXX There are many other result codes for resuming, ovewriting etc,
+        # XXX There are many other result codes for resuming, overwriting etc,
         #     implement
         if (res != c.FS_FILE_OK):
             filepath = None
@@ -4614,8 +4644,8 @@ class DirectoryModel(QAbstractTableModel):
         dllext = ".wfx" if platform_is_32bit() else ".wfx64"
         wfx_infos = [
             # XXX Use FsGetDefRootName for the root
-            WFXInfo(SHARE_ROOT + "\\webdav", os.path.join(OUT_DIR, "davplug", "davplug" + dllext)),
-            WFXInfo(SHARE_ROOT + "\\sftp", os.path.join(OUT_DIR, "sftpplug", "sftpplug" + dllext)),
+            WFXInfo(SHARE_ROOT + "\\webdav", os.path.join(PLUGIN_DIR, "davplug", "davplug" + dllext)),
+            WFXInfo(SHARE_ROOT + "\\sftp", os.path.join(PLUGIN_DIR, "sftpplug", "sftpplug" + dllext)),
             # XXX Disabled for now since it's crashing, it's from double
             #     commander and has extra entry points, may not be enough with
             #     hooking the total commander ones
@@ -4685,13 +4715,13 @@ class DirectoryModel(QAbstractTableModel):
             # XXX Refactor below into table
             # XXX All these should fall back to the plugin's "CanYouHandleThisFile" function
             if (ext_lower in TOTAL7ZIP_EXTENSIONS):
-                it = WCXFileInfoIterator(os.path.join(OUT_DIR, "total7zip", "total7zip" + dllext), arcpath, dirpath, recurse)
+                it = WCXFileInfoIterator(os.path.join(PLUGIN_DIR, "total7zip", "total7zip" + dllext), arcpath, dirpath, recurse)
                 
             elif (ext_lower == ".bz2"):
-                it = WCXFileInfoIterator(os.path.join(OUT_DIR, "bzip2dll" + dllext), arcpath, dirpath, recurse)
+                it = WCXFileInfoIterator(os.path.join(PLUGIN_DIR, "bzip2dll" + dllext), arcpath, dirpath, recurse)
                 
             elif (ext_lower == ".iso"):
-                it = WCXFileInfoIterator(os.path.join(OUT_DIR, "iso" + dllext), arcpath, dirpath, recurse)
+                it = WCXFileInfoIterator(os.path.join(PLUGIN_DIR, "iso" + dllext), arcpath, dirpath, recurse)
                 
             else:
                 # XXX This is hit when there's a permission violation accessing
@@ -4755,7 +4785,7 @@ class DirectoryModel(QAbstractTableModel):
         #       this should use an approach similar to sort where entries are 
         #       sorted and added wholesale and only permanent indices are 
         #       preserved
-            
+
         # XXX If file_dir and recurse match, do the filtering on the existing
         #     file_infos instead of performing the search/directory listing
         #     again
@@ -5093,12 +5123,15 @@ class DirectoryModel(QAbstractTableModel):
 
             else:
                 # Pick new if old is none, old if new is none, compare if both are not none
+                
+                # XXX fileinfo_cmp returns mismatch when attributes change even
+                #     if the name remains the same, this causes to properly
+                #     update, but triggers a deletion + insertion, which
+                #     disturbs the UI (current, selection), fix
                 c = 1 if (f_old is None) else (-1 if (f_new is None) else fileinfo_cmp(f_old, f_new, self.sort_field, self.sort_order == Qt.DescendingOrder))
 
             if (c == 0):
                 # Matching fileinfos, no need to insert
-                # XXX Update date/attribs if different? Then it will need to
-                #     send a datachanged?
                 i_old += 1
                 i_new += 1
             
@@ -5289,7 +5322,8 @@ class DirectoryModel(QAbstractTableModel):
             #     recursively and the signal will still trigger if some parent is
             #     deleted?)
             # XXX This doesn't seem to watch for attribute changes in existing
-            #     files either (eg date, size)
+            #     files either (eg date, size), ie fails to emit an update when a 
+            #     copy overwrites
             # XXX Check performance on network folders and allow to disable?
             self.watcher = QFileSystemWatcher([watch_dir])
             # XXX What if the directory (or file in case of archives) is
@@ -5453,10 +5487,12 @@ class DirectoryModel(QAbstractTableModel):
                         t = "<DIR>"
                     else: 
                         t = QLocale().toString(file_info.size)
-                    # t = "12345678901234567890"
 
                 else:
                     t = os.path.splitext(t)[1]
+                    # Remove dot from extension, splitext guarantees that will
+                    # be either empty or start with a dot
+                    t = t if (t == "") else t[1:]
 
             elif (index.column() == 3):
                 if (is_dir):
@@ -6301,12 +6337,6 @@ class FilePane(QWidget):
         self.list_view.installEventFilter(self)
         self.table_view.installEventFilter(self)
 
-        # Label font is too small, increase
-        font = QFont(self.disk_info_label.font().family(), self.disk_info_label.font().pointSize()+2)
-        self.disk_info_label.setFont(font)
-        self.directory_label.setFont(font)
-        self.summary_label.setFont(font)
-
         self.setLayout(layout)
 
         logger.info("ListView font %s pointSize %d height %d", self.list_view.font().family(), 
@@ -6915,6 +6945,8 @@ class FilePane(QWidget):
         self.openInExternalEditorAct = QAction("Open in External Editor", self, shortcut="F4", triggered=self.openInExternalEditor, shortcutContext=Qt.WidgetWithChildrenShortcut)
         self.openInCmdLineAct = QAction("Open In Command Line", self, shortcut="ctrl+.", triggered=self.openInCmdLine, shortcutContext=Qt.WidgetWithChildrenShortcut)
 
+        # XXX Create new window with ctrl+shift+n? is config file shared? what
+        #     about tab histories?
         # XXX LineEdit with directory name, bookmarks/favorites/history combobox
         # XXX Allow filtering files by typing name
         # XXX Allow multi renaming 
@@ -8155,12 +8187,14 @@ class FilePane(QWidget):
                             "Paste File",
                             "'%s' already exists, overwrite?" % os.path.basename(destination_path),
                             QMessageBox.Yes | QMessageBox.YesAll | QMessageBox.No | QMessageBox.NoAll | QMessageBox.Cancel,
-                            QMessageBox.Cancel
+                            QMessageBox.Yes
                         )
                         if (reply == QMessageBox.Cancel):
                             break
                         if (reply in [QMessageBox.No, QMessageBox.NoAll]):
                             continue
+                        
+                        os_remove(destination_path)
                         
                     try:
                         if is_cut_operation:
@@ -8467,7 +8501,7 @@ class FilePane(QWidget):
                     'Delete File',
                     'Are you sure you want to delete %r?' % filepath,
                     QMessageBox.Yes | QMessageBox.YesAll | QMessageBox.No | QMessageBox.Cancel,
-                    QMessageBox.Cancel
+                    QMessageBox.Yes
                 )
 
             if (reply in [QMessageBox.Yes, QMessageBox.YesAll]):
@@ -8568,6 +8602,10 @@ class TwinWindow(QMainWindow):
         # "general" as a group will be escaped into "#general". Just use the
         # root group for simplicity
         current_pane = qSettingsValue(settings,"current_pane", "left")
+        
+        # XXX This doesn't affect the window title, which looks small,
+        #     investigate?
+        self.setFontSize(qSettingsValue(settings, "font_size", qApp.font().pointSize()))
 
         self.setGeometry(qSettingsValue(settings,"window_geometry", QRect(0,0,1024,768)))
 
@@ -8752,6 +8790,9 @@ class TwinWindow(QMainWindow):
         self.closeTabAct = QAction("Close Tab", self, triggered=self.closeTab, shortcutContext=Qt.ApplicationShortcut)
         self.closeTabAct.setShortcuts(["ctrl+w", "ctrl+shift+t"])
 
+        self.increaseFontAct = QAction("Increase Font", self, shortcut="ctrl+shift++", triggered=lambda : self.setFontSize(1, True), shortcutContext=Qt.ApplicationShortcut)
+        self.decreaseFontAct = QAction("Decrease Font", self, shortcut="ctrl+shift+-", triggered=lambda : self.setFontSize(-1, True), shortcutContext=Qt.ApplicationShortcut)
+
         self.aboutAct = QAction("About", self, shortcut="F1", triggered=self.about, shortcutContext=Qt.ApplicationShortcut)
         self.profileAct = QAction("Profile", self, shortcut="ctrl+p", triggered=self.profile, shortcutContext=Qt.ApplicationShortcut)
 
@@ -8771,6 +8812,8 @@ class TwinWindow(QMainWindow):
         self.addAction(self.diffDirsAct)
         self.addAction(self.diffExternallyAct)
         self.addAction(self.swapPanesAct)
+        self.addAction(self.increaseFontAct)
+        self.addAction(self.decreaseFontAct)
         self.addAction(self.aboutAct)
         self.addAction(self.profileAct)
 
@@ -8862,6 +8905,10 @@ class TwinWindow(QMainWindow):
                 for filepath in filepaths:
                     destination_path = os.path.join(target_dir, os.path.basename(filepath))
                     if (os.path.exists(destination_path) and (reply != QMessageBox.YesAll)):
+                        # XXX This needs to reload the directory, looks like the
+                        #     watcher by design doesn't trigger when eg
+                        #     destination is overwritten and no new files are
+                        #     added? Change overwrite to delete + create?
                         if (reply == QMessageBox.NoAll):
                             continue
                         reply = QMessageBox.question(
@@ -8869,15 +8916,17 @@ class TwinWindow(QMainWindow):
                             "Copy File",
                             "'%s' already exists, overwrite?" % os.path.basename(destination_path),
                             QMessageBox.Yes | QMessageBox.YesAll | QMessageBox.No | QMessageBox.NoAll | QMessageBox.Cancel,
-                            QMessageBox.Cancel
+                            QMessageBox.Yes
                         )
                         if (reply == QMessageBox.Cancel):
                             break
                         if (reply in [QMessageBox.No, QMessageBox.NoAll]):
                             continue
 
+                        os_remove(destination_path)
+
                     try:
-                        # XXX Deselect files as they are copied?
+                        # XXX Deselect files as they are successfully copied?
                         if (move):
                             logger.info("Moving %r to %r", filepath, target_dir)
                             shutil.move(filepath, target_dir)
@@ -9440,6 +9489,28 @@ class TwinWindow(QMainWindow):
             else:
                 active_pane.setDirectory(bookmark)
 
+    def setFontSize(self, delta_or_size, delta=False):
+        logger.info("%d %s", delta_or_size, delta)
+
+        # All the widgets share the font with the app, as long as widgets don't
+        # set a different font, it's enough with getting a copy of the app's
+        # font and settting that copy back, the widgets will redraw and update
+        # accordingly
+        font = qApp.font()
+        font.setPointSize(max(1, (font.pointSize() + delta_or_size) if delta else delta_or_size))
+        qApp.setFont(font)
+
+        # File pane row height is overridden at initialization, needs to be
+        # updated
+        for file_pane in self.left_panes + self.right_panes:
+            # XXX Move this to FilePane.setFontSize?, it's duplicated in the
+            #     initialization
+
+            # XXX This could set the FilePane labels to a larger size, and if
+            #     the font is shared across panes, this could be done only once
+
+            # Shrink the row height to roughly font height
+            file_pane.table_view.verticalHeader().setDefaultSectionSize(file_pane.table_view.fontMetrics().height() + 6)
 
     def closeEvent(self, event):
         logger.info("closeEvent")
@@ -9464,6 +9535,7 @@ class TwinWindow(QMainWindow):
         # XXX Store main window geometry (position, size, monitor?), one entry
         #     per screen resolution?
         settings.setValue("window_geometry", self.geometry())
+        settings.setValue("font_size", qApp.font().pointSize())
         settings.setValue("external_viewer_filepath", g_external_viewer_filepath)
         settings.setValue("external_viewer_params", encode_string_list(g_external_viewer_params))
         settings.setValue("external_editor_filepath", g_external_editor_filepath)
@@ -9545,17 +9617,45 @@ class TwinWindow(QMainWindow):
         self.profiling = not self.profiling
 
     def about(self):
-        # XXX Put these in a listbox
         action_shortcuts = qGetActionShortcuts(self) + qGetActionShortcuts(self.left_panes[0]) + qGetActionShortcuts(self.left_panes[0].table_view)
         action_shortcuts = sorted(action_shortcuts, key=lambda a: a[0])
         action_shortcuts_html = string.join(["<tr><td>%s</td><td>%s</td></tr>" % (name, string.join(shortcuts, " ")) for name, shortcuts in action_shortcuts])
-        QMessageBox.about(self, "About Twin %s" % APPLICATION_VERSION,
-            "<b>Twin panel playground</b>"
+
+        # Mimic QMessageBox.about with an additional qscrollarea
+        # See https://github.com/qt/qtbase/blob/5.3/src/widgets/dialogs/qmessagebox.cpp#L1820
+        title = "About Twin %s" % APPLICATION_VERSION
+        text = ("<b>Twin panel playground</b>" 
             "<p>"
-            "<table>" + action_shortcuts_html + "</table>"
+            "Visit the <a href=\"https://github.com/antoniotejada/Twin\">github repo</a> for more information"
             "<p>"
-            "Visit the <a href=\"https://github.com/antoniotejada/Twin\">github repo</a> for more information</p>"
-        )
+            "Keyboard shortcuts:")
+        about = QMessageBox(QMessageBox.Information, title, text, QMessageBox.Ok, self)
+
+        icon = about.windowIcon()
+        size = icon.actualSize(QSize(64, 64))
+        about.setIconPixmap(icon.pixmap(size))
+        
+        text = "<table>" + action_shortcuts_html + "</table>"
+        label = QLabel(text)
+        scroll = QScrollArea()
+        scroll.setWidget(label)
+        # Froce the vertical scrollbar, otherwise the horizontal size is
+        # calculated without accounting for it and the horizontal scrollbar
+        # will appear when the vertical scrollbar does
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        scroll.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
+
+        grid = about.layout()
+        grid.addWidget(scroll, grid.rowCount()-2, grid.columnCount()-1)
+        grid.setRowMinimumHeight(grid.rowCount()-2, 500)
+        
+        # XXX This doesn't work, the grip appears but the window is not
+        #     resizeable, probably missing adding/removing some window 
+        #     creation flag hint
+        #about.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        #about.setSizeGripEnabled(True)
+
+        about.exec_()
 
 def restore_python_exceptions():
     # Remove pyqt except hook that hides exceptions
@@ -9594,11 +9694,6 @@ def main():
 
     app = QApplication(sys.argv)
 
-    # Reduce the app font size
-    font = app.font()
-    font.setPointSize(max(1, font.pointSize() - 1))
-    app.setFont(font)
-
     # Set the floppy disk as application icon
     app.setWindowIcon(qApp.style().standardIcon(QStyle.SP_DialogSaveButton)) 
 
@@ -9611,7 +9706,7 @@ def main():
             # addition that makes it appear properly and resolve the disk total
             # and free sizes in the directory label), but don't abspath network
             # root since it breaks    
-            if (not(os_path_contains(SHARE_ROOT, file_dir))):
+            if (not os_path_contains(SHARE_ROOT, file_dir)):
                 # If it doesn't exist, ask for a directory
                 if (not os.path.exists(file_dir)):
                     file_dir = qGetExistingDirectory(None, "Select Folder", os.getcwd())
